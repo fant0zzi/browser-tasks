@@ -114,11 +114,11 @@ class FakeAdapter:
     def capabilities(self): return None
     def claim(self, task_id): return ("tab-1",)
     def observe(self, task_id, target):
-        return BrowserObservation(task_id, None, target, {}, "pre")
+        return BrowserObservation(task_id, None, target, {}, "pre", "tab-1")
     def act(self, action):
-        return BrowserObservation(action.task_id, action.action_id, action.target, {"sent": "yes"}, "post")
+        return BrowserObservation(action.task_id, action.action_id, action.target, {"sent": "yes"}, "post", "tab-1")
     def capture(self, task_id, action_id):
-        return BrowserObservation(task_id, action_id, "", {}, "capture")
+        return BrowserObservation(task_id, action_id, "", {}, "capture", "tab-1")
 
 
 def test_orchestrator_blocks_then_consumes_exact_grant(tmp_path: Path) -> None:
@@ -137,3 +137,24 @@ def test_orchestrator_blocks_then_consumes_exact_grant(tmp_path: Path) -> None:
     result = orchestrator.execute(action, grant)
     assert result.outcome == "verified"
     assert result.consumed_grant and result.consumed_grant.uses == 1
+    with pytest.raises(ValueError, match="uses"):
+        orchestrator.execute(action, grant)
+
+
+def test_content_hash_is_not_wildcard() -> None:
+    action = BrowserAction("a", "task", ActionClass.COMMIT_EXTERNAL, "target", "send", (), "payload")
+    grant = AuthorizationGrant("g", "task", ActionClass.COMMIT_EXTERNAL, "target",
+                               summary_sha256(action), "2999-01-01T00:00:00+00:00")
+    from browser_tasks.authorization import validate_grant
+    with pytest.raises(ValueError, match="content"):
+        validate_grant(grant, action)
+
+
+def test_scanner_rejects_parent_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    assert any(f.kind == "unsupported_type" for f in scan_file(root, root / "link" / "secret.txt"))

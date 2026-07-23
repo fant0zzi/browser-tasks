@@ -2,8 +2,25 @@
 
 Browser Tasks is a task-scoped harness for browser automation, UI testing, and
 web research. A local agent remains the orchestrator and the only executor.
-Browser drivers perform observable actions; optional reasoning delegates such
-as ChatGPT Web provide untrusted planning or review advice.
+Browser drivers perform observable actions. For difficult planning or code
+review, the agent can optionally ask an external reasoning service such as
+ChatGPT Web for a second opinion.
+
+That second opinion is treated as **untrusted advice**. In practical terms:
+
+- the response may contain mistakes, stale assumptions, or instructions copied
+  from untrusted repository or webpage content;
+- it cannot approve a browser action, click a button, send a message, or change
+  task state;
+- the local agent must validate the response against the original request and
+  context hash before using it;
+- only the local agent may turn a suggestion into an authorized action and
+  verify the result in the browser.
+
+For example, ChatGPT Web may suggest a migration plan and point out risks. The
+local agent still decides which steps are relevant, asks for any required user
+approval, executes them through a browser adapter, and checks the resulting
+page state.
 
 ## Design
 

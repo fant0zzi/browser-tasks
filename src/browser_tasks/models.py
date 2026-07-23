@@ -123,6 +123,7 @@ class BrowserObservation:
     url: str
     state: dict[str, Any]
     evidence_sha256: str
+    resource_id: str | None = None
     schema_version: int = SCHEMA_VERSION
 
 

@@ -22,22 +22,29 @@ class Orchestrator:
         self.store = store.bind(task_id)
         self.task_id = task_id
         self.adapter = adapter
+        resources = adapter.claim(task_id)
+        self.store.bind_adapter(adapter.adapter_id, resources)
 
     def execute(self, action: BrowserAction, grant: AuthorizationGrant | None = None) -> ExecutionResult:
         if action.task_id != self.task_id:
             raise ValueError("action belongs to another task")
         task = self.store.load()
-        if task.state not in {TaskState.READY, TaskState.EXECUTING}:
-            raise ValueError("task is not executable")
+        if task.active_browser_adapter != self.adapter.adapter_id:
+            raise ValueError("adapter mismatch")
         used = None
         if requires_authorization(action.action_class):
             if grant is None:
                 raise PermissionError("consequential action requires authorization")
-            used = consume(grant, action)
+            self.store.install_grant(grant)
+            used = self.store.reserve_execution(action, grant.grant_id)
             self.store.append_event("authorization.consumed", {"grant_id": grant.grant_id, "action_id": action.action_id})
+        else:
+            self.store.reserve_execution(action, None)
         pre = self.adapter.observe(self.task_id, action.target)
         self.store.append_event("action.pre_state", {"action_id": action.action_id, "evidence": pre.evidence_sha256})
         observation = self.adapter.act(action)
+        if observation.resource_id not in task.owned_browser_resources:
+            raise ValueError("observation came from an unowned browser resource")
         outcome = verify(action, observation)
         self.store.append_event("action.result", {
             "action_id": action.action_id,

@@ -21,7 +21,7 @@ def validate_grant(grant: AuthorizationGrant, action: BrowserAction, now: dateti
         "class": grant.action_class == action.action_class,
         "target": grant.target == action.target,
         "summary": grant.summary_sha256 == summary_sha256(action),
-        "content": grant.content_sha256 is None or grant.content_sha256 == action.content_sha256,
+        "content": grant.content_sha256 == action.content_sha256,
         "expiry": current < expiry,
         "uses": grant.uses < grant.max_uses,
     }

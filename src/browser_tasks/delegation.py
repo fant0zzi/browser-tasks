@@ -8,6 +8,8 @@ def validate_disclosure(decision: DisclosureDecision, request: DelegationRequest
         raise ValueError("unsupported schema version")
     if decision.status != "approved":
         raise ValueError("disclosure is not approved")
+    if request.purpose not in {"plan", "review"}:
+        raise ValueError("unsupported delegation purpose")
     if (decision.task_id, decision.provider, decision.context_sha256) != (
         request.task_id, request.provider, request.context_sha256
     ):
@@ -21,5 +23,5 @@ def validate_response(request: DelegationRequest, response: DelegationResponse) 
         request.task_id, request.request_id, request.provider, request.context_sha256
     ):
         raise ValueError("delegation response does not match request")
-    if response.kind not in {"plan", "review"} or not isinstance(response.advice, dict):
+    if response.kind != request.purpose or not isinstance(response.advice, dict):
         raise ValueError("invalid delegation response")

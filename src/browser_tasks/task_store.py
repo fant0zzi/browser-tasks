@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import fcntl
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ from uuid import uuid4
 
 from .lifecycle import transition
 from .models import SCHEMA_VERSION, Task, TaskState
+from .models import AuthorizationGrant, BrowserAction, ActionClass
+from .authorization import validate_grant
 
 
 TASK_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9][a-z0-9-]*$")
@@ -59,7 +62,8 @@ class TaskStore:
                         created_at=datetime.now(UTC).isoformat(), state=TaskState.SCOPED)
             self._write_json(stage / "task.json", task.to_dict())
             for name, text in (("request.md", f"# Request\n\n{goal}\n"), ("notes.md", "# Notes\n"),
-                               ("result.md", "# Result\n\nWork in progress.\n"), ("events.jsonl", "")):
+                               ("result.md", "# Result\n\nWork in progress.\n"), ("events.jsonl", ""),
+                               ("authorizations.json", "{}\n")):
                 self._write_text(stage / name, text)
             os.rename(stage, final)
         except Exception:
@@ -90,14 +94,63 @@ class TaskStore:
                     owned_browser_resources=tuple(data.get("owned_browser_resources", [])))
 
     def transition(self, expected: TaskState, target: TaskState, *, verified: bool = False) -> Task:
-        task = self.load()
-        if task.state is not expected:
-            raise ValueError("stale task state")
-        state = transition(task.state, target, verified=verified)
-        changed = replace(task, state=state)
-        self.append_event("task.state_changing", {"from": expected.value, "to": target.value, "verified": verified})
-        self._write_json(self.path() / "task.json", changed.to_dict())
+        with self._lock():
+            task = self.load()
+            if task.state is not expected:
+                raise ValueError("stale task state")
+            state = transition(task.state, target, verified=verified)
+            changed = replace(task, state=state)
+            self._write_json(self.path() / "task.json", changed.to_dict())
+        self.append_event("task.state_changed", {"from": expected.value, "to": target.value, "verified": verified})
         return changed
+
+    def bind_adapter(self, adapter_id: str, resources: tuple[str, ...]) -> Task:
+        if not resources or any(not item for item in resources):
+            raise ValueError("adapter must claim resources")
+        with self._lock():
+            task = self.load()
+            if task.active_browser_adapter and task.active_browser_adapter != adapter_id:
+                raise ValueError("adapter mismatch")
+            changed = replace(task, active_browser_adapter=adapter_id, owned_browser_resources=tuple(resources))
+            self._write_json(self.path() / "task.json", changed.to_dict())
+        return changed
+
+    def install_grant(self, grant: AuthorizationGrant) -> None:
+        if grant.task_id != self._id():
+            raise ValueError("grant belongs to another task")
+        with self._lock():
+            grants = self._load_grants()
+            existing = grants.get(grant.grant_id)
+            encoded = self._grant_dict(grant)
+            if existing:
+                persisted = self._grant_from_dict(existing)
+                if replace(persisted, uses=grant.uses) != grant:
+                    raise ValueError("grant id already exists with different authorization")
+                return
+            if not existing:
+                grants[grant.grant_id] = encoded
+                self._write_json(self.path() / "authorizations.json", grants)
+
+    def reserve_execution(self, action: BrowserAction, grant_id: str | None) -> AuthorizationGrant | None:
+        with self._lock():
+            task = self.load()
+            if task.state not in {TaskState.READY, TaskState.EXECUTING}:
+                raise ValueError("task is not executable")
+            if not task.active_browser_adapter or not task.owned_browser_resources:
+                raise ValueError("browser adapter is not bound")
+            used = None
+            if grant_id:
+                grants = self._load_grants()
+                if grant_id not in grants:
+                    raise PermissionError("grant is not installed")
+                used = self._grant_from_dict(grants[grant_id])
+                validate_grant(used, action)
+                used = replace(used, uses=used.uses + 1)
+                grants[grant_id] = self._grant_dict(used)
+                self._write_json(self.path() / "authorizations.json", grants)
+            if task.state is TaskState.READY:
+                self._write_json(self.path() / "task.json", replace(task, state=TaskState.EXECUTING).to_dict())
+            return used
 
     def append_event(self, event_type: str, payload: dict) -> None:
         task_id = self._id()
@@ -113,6 +166,33 @@ class TaskStore:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _lock(self):
+        class Lock:
+            def __init__(self, target): self.target = target
+            def __enter__(self):
+                self.fd = os.open(self.target, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            def __exit__(self, *_):
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                os.close(self.fd)
+        return Lock(self.path() / ".lock")
+
+    def _load_grants(self) -> dict:
+        target = self.path() / "authorizations.json"
+        if target.is_symlink():
+            raise ValueError("authorization store must not be a symlink")
+        return json.loads(target.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _grant_dict(grant: AuthorizationGrant) -> dict:
+        data = grant.__dict__.copy()
+        data["action_class"] = grant.action_class.value
+        return data
+
+    @staticmethod
+    def _grant_from_dict(data: dict) -> AuthorizationGrant:
+        return AuthorizationGrant(**{**data, "action_class": ActionClass(data["action_class"])})
 
     @staticmethod
     def _write_text(target: Path, text: str) -> None:
