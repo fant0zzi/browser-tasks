@@ -102,3 +102,46 @@ class RoutingDecision:
     reasons: tuple[str, ...] = field(default_factory=tuple)
     blocked_reasons: tuple[str, ...] = field(default_factory=tuple)
     schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class BrowserAction:
+    action_id: str
+    task_id: str
+    action_class: ActionClass
+    target: str
+    summary: str
+    postconditions: tuple[dict[str, str], ...]
+    content_sha256: str | None = None
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class BrowserObservation:
+    task_id: str
+    action_id: str | None
+    url: str
+    state: dict[str, Any]
+    evidence_sha256: str
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class DelegationRequest:
+    task_id: str
+    request_id: str
+    provider: str
+    context_sha256: str
+    purpose: str
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class DelegationResponse:
+    task_id: str
+    request_id: str
+    provider: str
+    context_sha256: str
+    kind: str
+    advice: dict[str, Any]
+    schema_version: int = SCHEMA_VERSION
