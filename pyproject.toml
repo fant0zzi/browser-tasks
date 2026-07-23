@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-tasks"
+version = "0.1.0"
+description = "Task-scoped browser automation harness with optional reasoning delegates"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+browser-tasks = "browser_tasks.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
