@@ -6,13 +6,21 @@ import pytest
 
 from browser_tasks.lifecycle import transition
 from browser_tasks.authorization import summary_sha256
-from browser_tasks.delegation import validate_disclosure, validate_response
+from browser_tasks.delegation import (
+    validate_disclosure,
+    validate_request_policy,
+    validate_response,
+)
 from browser_tasks.models import (
     ActionClass, AuthorizationGrant, BrowserAction, BrowserObservation,
     DelegationRequest, DelegationResponse, DisclosureDecision, RoutingInput, TaskState,
 )
 from browser_tasks.orchestrator import Orchestrator
-from browser_tasks.policy import requires_authorization, retry_policy
+from browser_tasks.policy import (
+    ensure_external_tool_allowed,
+    requires_authorization,
+    retry_policy,
+)
 from browser_tasks.routing import assess
 from browser_tasks.scanner import scan_file
 from browser_tasks.task_store import TaskStore
@@ -33,9 +41,39 @@ def test_task_store_creates_complete_shape(tmp_path: Path) -> None:
     task_id = "20260724-010000-example"
     task = TaskStore(tmp_path).create(task_id, "Test goal")
     assert task.state is TaskState.SCOPED
+    assert task.delegation_policy == "maximal"
+    assert task.allowed_browser_adapters == ("surf",)
+    assert task.delegate_transport == "surf-ui"
+    assert task.fallback_policy == "block"
+    assert task.external_tool_policy == "surf_chatgpt_only"
     for name in ("request.md", "notes.md", "result.md", "task.json", "events.jsonl", "artifacts", "evidence", "delegations"):
         assert (tmp_path / "tasks" / task_id / name).exists()
     assert (tmp_path / "tasks" / task_id).stat().st_mode & 0o077 == 0
+
+
+def test_existing_task_can_enforce_delegate_first_policy(tmp_path: Path) -> None:
+    task_id = "20260724-010000-example"
+    store = TaskStore(tmp_path)
+    store.create(task_id, "Goal", delegation_policy="suggest")
+    task = store.bind(task_id).enforce_delegate_first_policy()
+    assert task.delegation_policy == "maximal"
+    assert task.allowed_browser_adapters == ("surf",)
+    assert task.delegate_provider == "chatgpt-web"
+    assert task.delegate_transport == "surf-ui"
+    assert task.reasoning_effort == "best"
+    assert task.deep_research_policy == "auto"
+    assert task.fallback_policy == "block"
+    assert task.external_tool_policy == "surf_chatgpt_only"
+
+
+def test_external_tool_guard_is_fail_closed(tmp_path: Path) -> None:
+    task = TaskStore(tmp_path).create("20260724-010000-example", "Goal")
+    ensure_external_tool_allowed(task, "browser", "surf")
+    ensure_external_tool_allowed(task, "research", "web-chat")
+    with pytest.raises(PermissionError, match="firecrawl"):
+        ensure_external_tool_allowed(task, "research", "firecrawl")
+    with pytest.raises(PermissionError, match="in-app-browser"):
+        ensure_external_tool_allowed(task, "browser", "in-app-browser")
 
 
 def test_lifecycle_requires_verification() -> None:
@@ -54,19 +92,65 @@ def test_consequential_action_policy() -> None:
 
 
 def test_routing_is_deterministic_and_disclosure_gated() -> None:
-    local = assess(RoutingInput(deterministic=True, dependent_steps=2, provider_available=True))
+    local = assess(RoutingInput(
+        deterministic=True, dependent_steps=2, local_test_decides=True,
+        provider_available=True,
+    ))
     assert local.decision == "local"
-    suggested = assess(RoutingInput(
+    blocked = assess(RoutingInput(
         architecture=True, dependent_steps=12, safety_review=True,
         relevant_files=8, provider_available=True, disclosure_authorized=False,
     ))
-    assert suggested.decision == "suggest"
-    assert "disclosure not authorized" in suggested.blocked_reasons
+    assert blocked.decision == "blocked"
+    assert blocked.fallback_policy == "block"
+    assert "disclosure not authorized" in blocked.blocked_reasons
     delegated = assess(RoutingInput(
         architecture=True, dependent_steps=12, safety_review=True,
         relevant_files=8, provider_available=True, disclosure_authorized=True,
     ))
     assert delegated.decision == "delegate"
+    assert delegated.provider == "chatgpt-web"
+    assert delegated.transport == "surf-ui"
+    assert delegated.reasoning_effort == "best"
+
+
+def test_routing_uses_standard_research_by_default() -> None:
+    standard = assess(RoutingInput(
+        web_research=True,
+        current_information=True,
+        cross_source_synthesis=True,
+        disclosure_authorized=True,
+    ))
+    assert standard.decision == "delegate"
+    assert standard.research_mode == "standard"
+
+
+def test_routing_uses_deep_research_for_large_complex_corpora() -> None:
+    deep = assess(RoutingInput(
+        web_research=True,
+        current_information=True,
+        cross_source_synthesis=True,
+        large_research_volume=True,
+        disclosure_authorized=True,
+    ))
+    assert deep.decision == "delegate"
+    assert deep.research_mode == "deep"
+    unavailable = assess(RoutingInput(
+        web_research=True,
+        regulatory=True,
+        large_research_volume=True,
+        deep_research_available=False,
+        disclosure_authorized=True,
+    ))
+    assert unavailable.decision == "blocked"
+    assert "deep research required but unavailable" in unavailable.blocked_reasons
+    wrong_transport = assess(RoutingInput(
+        web_research=True,
+        disclosure_authorized=True,
+        requested_transport="in-app-browser",
+    ))
+    assert wrong_transport.decision == "blocked"
+    assert "only surf-ui transport is allowed" in wrong_transport.blocked_reasons
 
 
 def test_scanner_finds_secrets_binary_and_task_material(tmp_path: Path) -> None:
@@ -108,8 +192,33 @@ def test_delegation_is_bound_to_provider_context_and_request() -> None:
         validate_response(request, DelegationResponse("task", "other", "chatgpt-web", "abc", "review", {}))
 
 
+def test_delegation_request_is_bound_to_strict_task_policy(tmp_path: Path) -> None:
+    task = TaskStore(tmp_path).create("20260724-010000-example", "Goal")
+    request = DelegationRequest(
+        task.task_id,
+        "req",
+        "chatgpt-web",
+        "abc",
+        "research",
+        research_mode="deep",
+    )
+    validate_request_policy(task, request)
+    with pytest.raises(PermissionError, match="transport"):
+        validate_request_policy(
+            task,
+            DelegationRequest(
+                task.task_id,
+                "req",
+                "chatgpt-web",
+                "abc",
+                "research",
+                transport="api",
+            ),
+        )
+
+
 class FakeAdapter:
-    adapter_id = "fake"
+    adapter_id = "surf:fake"
 
     def capabilities(self): return None
     def claim(self, task_id): return ("tab-1",)
@@ -119,6 +228,18 @@ class FakeAdapter:
         return BrowserObservation(action.task_id, action.action_id, action.target, {"sent": "yes"}, "post", "tab-1")
     def capture(self, task_id, action_id):
         return BrowserObservation(task_id, action_id, "", {}, "capture", "tab-1")
+
+
+class ForbiddenAdapter(FakeAdapter):
+    adapter_id = "in-app-browser:fake"
+
+
+def test_orchestrator_rejects_non_surf_adapter(tmp_path: Path) -> None:
+    task_id = "20260724-010000-example"
+    store = TaskStore(tmp_path)
+    store.create(task_id, "Goal")
+    with pytest.raises(PermissionError, match="forbidden"):
+        Orchestrator(store, task_id, ForbiddenAdapter())
 
 
 def test_orchestrator_blocks_then_consumes_exact_grant(tmp_path: Path) -> None:

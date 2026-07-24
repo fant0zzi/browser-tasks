@@ -1,26 +1,26 @@
 # Browser Tasks
 
 Browser Tasks is a task-scoped harness for browser automation, UI testing, and
-web research. A local agent remains the orchestrator and the only executor.
-Browser drivers perform observable actions. For difficult planning or code
-review, the agent can optionally ask an external reasoning service such as
-ChatGPT Web for a second opinion.
+web research through the user's authenticated browser.
 
-That second opinion is treated as **untrusted advice**. In practical terms:
+Its default operating model is:
 
-- the response may contain mistakes, stale assumptions, or instructions copied
-  from untrusted repository or webpage content;
-- it cannot approve a browser action, click a button, send a message, or change
-  task state;
-- the local agent must validate the response against the original request and
-  context hash before using it;
-- only the local agent may turn a suggestion into an authorized action and
-  verify the result in the browser.
-
-For example, ChatGPT Web may suggest a migration plan and point out risks. The
-local agent still decides which steps are relevant, asks for any required user
-approval, executes them through a browser adapter, and checks the resulting
-page state.
+- **Surf-only browser execution.** Tabs and authenticated sessions belong to
+  the user's browser. In-app browsers, direct browser APIs, and silent transport
+  fallbacks are forbidden by the task policy.
+- **Maximal ChatGPT Web delegation.** The local agent keeps short,
+  deterministic observation and execution local. Planning, unfamiliar
+  reasoning, architecture, review, and research go to ChatGPT Web.
+- **Strongest available reasoning.** Delegations request `best`, which selects
+  Max when available and otherwise High. The selected level is verified and
+  recorded.
+- **Deep Research for large, complex corpora.** Standard research is the
+  default. Deep Research is selected only for an explicit request or for
+  exhaustive, high-volume work that also requires cross-source, regulatory,
+  unfamiliar-domain, or high-branching analysis.
+- **One local executor.** Web-chat answers are untrusted advice. They cannot
+  authorize or execute browser actions; the local orchestrator validates them
+  and performs authorized actions exactly once.
 
 ## Design
 
@@ -28,39 +28,84 @@ page state.
 user request
     │
     ▼
-task store ──► deterministic router ──► optional reasoning delegate
-    │                                        │
-    │                              untrusted plan/review
-    ▼                                        │
-policy + authorization ◄─────────────────────┘
+task store ──► deterministic delegate-first router
+    │                          │
+    │              simple     ├── ChatGPT Web / best reasoning
+    │              local      └── ChatGPT Web / Deep Research
+    │                                      │
+    ▼                              untrusted response
+policy + authorization ◄───────────────────┘
     │
     ▼
-browser adapter ──► evidence ──► postcondition verification
+Surf in user browser ──► evidence ──► postcondition verification
 ```
 
-The boundaries are deliberate:
+The router is enforceable policy, not a recommendation. New tasks default to:
 
-- A task may read only its approved repository context and its own task folder.
-- External disclosure and browser side effects are separate authorizations.
-- A delegate response can suggest work but cannot authorize or execute it.
-- Consequential actions are proposed, authorized, executed once, and verified.
-- An ambiguous result blocks automatic retry.
+```text
+delegation_policy=maximal
+browser_policy=user_browser_only
+allowed_browser_adapters=surf
+delegate_provider=chatgpt-web
+delegate_transport=surf-ui
+reasoning_effort=best
+deep_research_policy=auto
+fallback_policy=block
+external_tool_policy=surf_chatgpt_only
+```
+
+Agents can fail closed before an external action:
+
+```sh
+PYTHONPATH=src python3 -m browser_tasks.cli guard \
+  20260724-120000-example --capability research --tool web-chat
+```
+
+The same guard rejects `firecrawl`, `web.run`, `in-app-browser`, and other
+non-allowlisted browser/research routes.
 
 ## Quick start
 
 The Python core requires Python 3.11+ and has no runtime dependencies.
 
 ```sh
-python3 -m browser_tasks.cli task init \
+PYTHONPATH=src python3 -m browser_tasks.cli task init \
   20260724-120000-example \
-  --goal "Check a browser workflow"
-
-python3 -m browser_tasks.cli route \
-  --architecture --steps 10 --files 8 --safety-review
+  --goal "Research and execute a browser workflow"
 ```
 
-For a source checkout, set `PYTHONPATH=src` or install it in a virtual
-environment. The task command creates the complete task shape:
+Upgrade an existing task to the strict policy:
+
+```sh
+PYTHONPATH=src python3 -m browser_tasks.cli task enforce-policy \
+  20260724-120000-example
+```
+
+Classify a focused current-information task:
+
+```sh
+PYTHONPATH=src python3 -m browser_tasks.cli route \
+  --web-research \
+  --current-information \
+  --cross-source-synthesis \
+  --steps 10 \
+  --disclosure-authorized
+```
+
+This returns a ChatGPT Web / Surf UI / standard research route. Add
+`--large-research-volume` when the task must search or reconcile a large,
+exhaustive corpus; add `--deep-research` only to request Deep Research
+explicitly.
+
+A short, deterministic live check stays local only when a direct observation
+or test can decide it:
+
+```sh
+PYTHONPATH=src python3 -m browser_tasks.cli route \
+  --deterministic --steps 2 --live-observation-primary
+```
+
+Each task receives:
 
 ```text
 tasks/<task-id>/
@@ -74,59 +119,79 @@ tasks/<task-id>/
 └── delegations/
 ```
 
-Runtime task contents are ignored by Git. `tasks/.gitkeep` preserves the root.
+## ChatGPT Web delegate
+
+`tools/web-chat/web-chat.zsh` is the canonical general-purpose delegate. It:
+
+1. freezes the exact prompt and optional attachment;
+2. produces a disclosure receipt and deterministic context SHA-256;
+3. requires that exact SHA for live submission;
+4. opens a dedicated ChatGPT tab through Surf;
+5. fills the exact prompt, selects the requested research mode, and verifies
+   the composer state immediately before submission;
+6. submits once and verifies the new user message;
+7. waits for completion and saves the answer, links, URL, tab ID, and hashes.
+
+Prepare without sending:
+
+```sh
+tools/web-chat/web-chat.zsh \
+  --task-id 20260724-120000-example \
+  --purpose research \
+  --reasoning best \
+  --research deep \
+  --task-file /tmp/exact-research-task.md \
+  --prepare-only
+```
+
+After approval of the printed context SHA:
+
+```sh
+tools/web-chat/web-chat.zsh \
+  --task-id 20260724-120000-example \
+  --purpose research \
+  --reasoning best \
+  --research deep \
+  --task-file /tmp/exact-research-task.md \
+  --approved-context-sha <exact-sha>
+```
+
+There is intentionally no `--transport api` and no local or in-app browser
+fallback.
+
+## Repository review
+
+`tools/web-review/web-review.zsh` safely freezes repository, diff, or selected
+context, then hands the verified artifact to the same strict web-chat delegate.
+It excludes `tasks/**`, credential filenames, key material, and unsupported
+entries; validates source stability and archive manifests; and requires the
+delegate's exact disclosure SHA before a live run.
 
 ## Lifecycle and authorization
-
-The core validates explicit transitions:
 
 ```text
 NEW → SCOPED → PLANNED → READY → EXECUTING → VERIFYING → COMPLETED
                               ↘ AWAITING_AUTHORIZATION ↗
 ```
 
-Blocked, cancelled, and failed outcomes are represented explicitly. Completion
-requires verified evidence.
-
-Actions are classified as observation, navigation, mutation preparation,
-external commit, identity/credential, financial, or destructive. External
-commit and higher classes require a task-bound grant for the exact target and
-content digest. A web-chat answer is never a grant.
-
-## Delegation policy
-
-The default mode is `suggest`. A deterministic score considers branching,
-dependent steps, file count, safety review, repeated failures, and whether a
-local test or live observation can answer more cheaply. It uses no extra model
-call. Small deterministic workflows stay local. High-scoring planning or
-review is delegated only after disclosure is approved for the exact context
-hash.
-
-ChatGPT Web is one optional delegate provider. It is useful for complex
-architecture, adversarial review, and large evidence synthesis; it is not the
-browser harness itself.
-
-## Disclosure controls
-
-Task directories are excluded from repository review packages by default.
-The Python scanner reports known credential filenames, private keys,
-authorization/cookie headers, credential-bearing URLs, token assignments,
-binary files, and task material. Findings are reported rather than silently
-redacted so an operator can make a disclosure decision tied to an exact
-SHA-256.
-
-The existing `tools/web-review` command remains a compatibility helper while
-its snapshot logic is migrated. It retains its hostile-path and mutation smoke
-suite, now excludes all `tasks/**` by default, and validates the ChatGPT origin
-after submission.
+External disclosure and browser side effects remain independent
+authorizations. Consequential actions require a task-bound grant for their
+exact target, summary, content digest, expiry, and use count. An ambiguous
+result blocks automatic retry.
 
 ## Validation
 
 ```sh
 PYTHONPATH=src pytest
+zsh -n tools/web-chat/web-chat.zsh
+zsh -n tools/web-chat/smoke-test.zsh
+tools/web-chat/smoke-test.zsh
 zsh -n tools/web-review/web-review.zsh
 zsh -n tools/web-review/smoke-test.zsh
 tools/web-review/smoke-test.zsh
 ```
 
-Live ChatGPT submission is intentionally a manually gated integration test.
+The web-chat smoke test uses a fake Surf executable. It proves deterministic
+disclosure hashes, rejection before Surf on mismatched approval, Max-before-
+High selection, post-fill research-mode verification, response capture, and absence of API
+fallback without touching a real browser.

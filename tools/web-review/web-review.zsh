@@ -6,6 +6,7 @@ umask 077
 
 readonly PROGRAM="${0:t}"
 readonly SCRIPT_DIR="${0:A:h}"
+readonly WEB_CHAT_DELEGATE="${SCRIPT_DIR:h}/web-chat/web-chat.zsh"
 temp_root="${TMPDIR:-/tmp}"
 readonly SYSTEM_TMP_ROOT="${temp_root:A}"
 unset temp_root
@@ -22,19 +23,22 @@ Modes:
   selected   Package only the named repository-relative files or directories.
 
 Options:
+  --task-id ID      Active Browser Tasks task ID.
   --task TEXT       Review task sent with the context.
   --task-file FILE  Read the review task from a file.
   --base REF        Diff base. Defaults to origin/HEAD, main, or master.
-  --transport KIND  Submission transport: ui (default) or api.
-  --chat-url URL    ChatGPT URL for ui transport (or WEB_REVIEW_CHAT_URL).
-  --model MODEL     Model for --transport api only.
+  --chat-url URL    ChatGPT URL for Surf UI (or WEB_REVIEW_CHAT_URL).
+  --reasoning LEVEL best|high|max (default: best).
+  --research MODE   standard|deep (default: standard).
+  --approved-context-sha H
+                    Exact SHA printed by the delegate prepare-only phase.
   --plain           Send a frozen patch (diff) or one regular file (selected).
-  --prepare-only    Build and verify the package without uploading it.
+  --prepare-only    Build, verify, and prepare exact disclosure without upload.
   -h, --help        Show this help.
 
 The context file and its receipt are written to a private directory under the
-system temporary directory. Upload always requires an interactive confirmation.
-This command never applies or imports the answer.
+system temporary directory. The only live transport is ChatGPT Web through Surf
+UI in the user browser. The delegate captures the answer and never falls back.
 '
 }
 
@@ -255,15 +259,6 @@ enforce_source_fingerprint() {
   [[ "$before" == "$after" ]] && return 0
   discard_private_output_dir "$private_output_dir"
   fail "repository changed while context was being prepared; discarded the output"
-}
-
-submit_via_api() {
-  local prompt="$1" context_file="$2" model="$3"
-  local -a command_args
-
-  command_args=(chatgpt "$prompt" --file "$context_file")
-  [[ -n "$model" ]] && command_args+=(--model "$model")
-  surf "${command_args[@]}"
 }
 
 submit_via_ui() {
@@ -498,11 +493,7 @@ submit_via_ui() {
 
 submit_to_web_chat() {
   local prompt="$1" context_file="$2"
-
-  case "$transport" in
-    ui) submit_via_ui "$prompt" "$context_file" "$chat_url" ;;
-    api) submit_via_api "$prompt" "$context_file" "$model" ;;
-  esac
+  submit_via_ui "$prompt" "$context_file" "$chat_url"
 }
 
 render_prompt() {
@@ -576,12 +567,15 @@ case "$mode" in
   *) fail "unknown mode: $mode" ;;
 esac
 
+task_id=""
 task_text=""
 task_file=""
 base_ref=""
-model=""
-transport=ui
+transport=surf-ui
 chat_url="${WEB_REVIEW_CHAT_URL:-https://chatgpt.com}"
+reasoning=best
+research_mode=standard
+approved_context_sha=""
 prepare_only=0
 plain=0
 typeset -a selected_paths
@@ -589,6 +583,11 @@ selected_paths=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --task-id)
+      [[ $# -ge 2 ]] || fail "--task-id requires a value"
+      task_id="$2"
+      shift 2
+      ;;
     --task)
       [[ $# -ge 2 ]] || fail "--task requires a value"
       task_text="$2"
@@ -605,18 +604,29 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model)
-      [[ $# -ge 2 ]] || fail "--model requires a value"
-      model="$2"
-      shift 2
+      fail "--model was removed; ChatGPT Web reasoning is selected in Surf UI"
       ;;
     --transport)
-      [[ $# -ge 2 ]] || fail "--transport requires a value"
-      transport="$2"
-      shift 2
+      fail "--transport was removed; only Surf UI is allowed"
       ;;
     --chat-url)
       [[ $# -ge 2 ]] || fail "--chat-url requires a value"
       chat_url="$2"
+      shift 2
+      ;;
+    --reasoning)
+      [[ $# -ge 2 ]] || fail "--reasoning requires a value"
+      reasoning="$2"
+      shift 2
+      ;;
+    --research)
+      [[ $# -ge 2 ]] || fail "--research requires a value"
+      research_mode="$2"
+      shift 2
+      ;;
+    --approved-context-sha)
+      [[ $# -ge 2 ]] || fail "--approved-context-sha requires a value"
+      approved_context_sha="$2"
       shift 2
       ;;
     --prepare-only)
@@ -652,15 +662,15 @@ if [[ -n "$task_file" ]]; then
   task_text="$(<"$task_file")"
 fi
 [[ -n "${task_text//[[:space:]]/}" ]] || fail "a non-empty --task or --task-file is required"
-
-[[ "$transport" == "ui" || "$transport" == "api" ]] \
-  || fail "--transport must be 'ui' or 'api'"
-[[ -z "$model" || "$transport" == "api" ]] || fail "--model is valid only with --transport api"
-if [[ "$transport" == "ui" ]]; then
-  [[ "$chat_url" == "https://chatgpt.com" || "$chat_url" == "https://chatgpt.com/"* ]] \
-    || fail "UI chat URL must use the https://chatgpt.com origin"
-  [[ "$chat_url" != *[[:space:]]* ]] || fail "UI chat URL must not contain whitespace"
-fi
+[[ "$task_id" =~ '^[0-9]{8}-[0-9]{6}-[a-z0-9][a-z0-9-]*$' ]] \
+  || fail "invalid or missing --task-id"
+[[ "$reasoning" == best || "$reasoning" == high || "$reasoning" == max ]] \
+  || fail "--reasoning must be best, high, or max"
+[[ "$research_mode" == standard || "$research_mode" == deep ]] \
+  || fail "--research must be standard or deep"
+[[ "$chat_url" == "https://chatgpt.com" || "$chat_url" == "https://chatgpt.com/"* ]] \
+  || fail "UI chat URL must use the https://chatgpt.com origin"
+[[ "$chat_url" != *[[:space:]]* ]] || fail "UI chat URL must not contain whitespace"
 [[ "$mode" == "diff" || -z "$base_ref" ]] || fail "--base is valid only in diff mode"
 [[ "$mode" != "repo" || "$plain" -eq 0 ]] || fail "--plain is not supported in repo mode"
 if [[ "$mode" == "selected" ]]; then
@@ -1014,23 +1024,30 @@ else
   print -r -- "Excluded:  recorded in the receipt"
 fi
 print -r -- "Size:      $artifact_bytes bytes"
-print -r -- "Transport: $transport"
-[[ "$transport" == "ui" ]] && print -r -- "Destination: $chat_url"
+print -r -- "Transport: Surf UI (user browser)"
+print -r -- "Destination: $chat_url"
 
+prompt="$(render_prompt "$task_text" "$artifact_hash" "$artifact_bytes")"
+[[ -x "$WEB_CHAT_DELEGATE" ]] \
+  || fail "strict web-chat delegate is missing or not executable"
+typeset -a delegate_args
+delegate_args=(
+  --task-id "$task_id"
+  --purpose review
+  --reasoning "$reasoning"
+  --research "$research_mode"
+  --chat-url "$chat_url"
+  --task "$prompt"
+  --attachment "$artifact"
+)
 if (( prepare_only )); then
+  if [[ "${WEB_REVIEW_TEST_MODE:-}" == 1 ]]; then
+    exit 0
+  fi
+  "$WEB_CHAT_DELEGATE" "${delegate_args[@]}" --prepare-only
   exit 0
 fi
-
-[[ -t 0 ]] || fail "upload requires an interactive terminal; rerun there or use --prepare-only"
-print -u2 -r -- ""
-print -u2 -r -- "This will upload the prepared context file to ChatGPT through Surf."
-read -q "reply?Continue? [y/N] "
-print -u2 -r -- ""
-[[ "$reply" == [yY] ]] || {
-  print -u2 -r -- "Upload cancelled; prepared files were kept."
-  exit 0
-}
-
-require_command surf
-prompt="$(render_prompt "$task_text" "$artifact_hash" "$artifact_bytes")"
-submit_to_web_chat "$prompt" "$artifact"
+[[ -n "$approved_context_sha" ]] \
+  || fail "live submission requires --approved-context-sha from prepare-only"
+"$WEB_CHAT_DELEGATE" "${delegate_args[@]}" \
+  --approved-context-sha "$approved_context_sha"

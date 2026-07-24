@@ -39,8 +39,16 @@ class Task:
     created_at: str
     state: TaskState = TaskState.NEW
     constraints: tuple[str, ...] = ()
-    delegation_policy: str = "suggest"
+    delegation_policy: str = "maximal"
     authorization_policy: str = "explicit"
+    browser_policy: str = "user_browser_only"
+    allowed_browser_adapters: tuple[str, ...] = ("surf",)
+    delegate_provider: str = "chatgpt-web"
+    delegate_transport: str = "surf-ui"
+    reasoning_effort: str = "best"
+    deep_research_policy: str = "auto"
+    fallback_policy: str = "block"
+    external_tool_policy: str = "surf_chatgpt_only"
     active_browser_adapter: str | None = None
     owned_browser_resources: tuple[str, ...] = ()
     schema_version: int = SCHEMA_VERSION
@@ -90,9 +98,21 @@ class RoutingInput:
     local_test_decides: bool = False
     live_observation_primary: bool = False
     sensitive_broad_context: bool = False
+    web_research: bool = False
+    current_information: bool = False
+    cross_source_synthesis: bool = False
+    regulatory: bool = False
+    unfamiliar_domain: bool = False
+    large_research_volume: bool = False
+    deep_research_requested: bool = False
+    deep_research_available: bool = True
     provider_available: bool = True
+    transport_available: bool = True
     disclosure_authorized: bool = False
     user_forced: bool = False
+    maximal_delegation: bool = True
+    requested_provider: str = "chatgpt-web"
+    requested_transport: str = "surf-ui"
 
 
 @dataclass(frozen=True)
@@ -101,6 +121,11 @@ class RoutingDecision:
     score: int
     reasons: tuple[str, ...] = field(default_factory=tuple)
     blocked_reasons: tuple[str, ...] = field(default_factory=tuple)
+    provider: str | None = None
+    transport: str | None = None
+    reasoning_effort: str = "best"
+    research_mode: str = "none"
+    fallback_policy: str = "block"
     schema_version: int = SCHEMA_VERSION
 
 
@@ -134,6 +159,10 @@ class DelegationRequest:
     provider: str
     context_sha256: str
     purpose: str
+    transport: str = "surf-ui"
+    reasoning_effort: str = "best"
+    research_mode: str = "standard"
+    fallback_policy: str = "block"
     schema_version: int = SCHEMA_VERSION
 
 

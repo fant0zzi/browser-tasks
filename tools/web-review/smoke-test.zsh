@@ -3,9 +3,11 @@
 emulate -LR zsh
 setopt errexit nounset pipefail
 umask 077
+export WEB_REVIEW_TEST_MODE=1
 
 readonly SCRIPT_DIR="${0:A:h}"
 readonly HARNESS="$SCRIPT_DIR/web-review.zsh"
+readonly SMOKE_TASK_ID="20260724-120000-web-review-smoke"
 readonly SENTINEL="FORBIDDEN_SENTINEL_WEB_REVIEW_7f91a3"
 readonly HOSTILE_PATH=':(glob)**'
 readonly REAL_TAR_PATH="$(command -v tar)"
@@ -82,7 +84,7 @@ prepared_artifact() {
 populate_fake_bin() {
   local target_bin="$1" omitted="${2:-}" command_name
   mkdir -p -- "$target_bin"
-  for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc tr date; do
+  for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc tr date sed base64; do
     [[ "$command_name" == "$omitted" ]] && continue
     ln -s -- "$(command -v "$command_name")" "$target_bin/$command_name"
   done
@@ -132,7 +134,8 @@ git -C "$fixture" commit -qm "test: create fixture"
 print -r -- "$SENTINEL" > "$fixture/.env"
 if forbidden_only_output="$(
   cd "$fixture"
-  "$HARNESS" diff --base HEAD --task "Forbidden-only smoke." --prepare-only 2>&1
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base HEAD \
+    --task "Forbidden-only smoke." --prepare-only 2>&1
 )"; then
   die "forbidden-only diff unexpectedly succeeded"
 fi
@@ -146,7 +149,8 @@ for weird_path in "${weird_paths[@]}"; do
 done
 archive_output="$(
   cd "$fixture"
-  "$HARNESS" diff --base HEAD --task "Regression smoke." --prepare-only
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base HEAD \
+    --task "Regression smoke." --prepare-only
 )"
 archive="$(prepared_artifact "$archive_output")"
 artifacts+=("$archive")
@@ -183,8 +187,8 @@ rm -f -- "$unpacked/repository/.env"
 
 plain_output="$(
   cd "$fixture"
-  "$HARNESS" diff --base HEAD --task "Regression smoke." \
-    --transport api --model smoke-model --plain --prepare-only
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base HEAD \
+    --task "Regression smoke." --plain --prepare-only
 )"
 plain_patch="$(prepared_artifact "$plain_output")"
 artifacts+=("$plain_patch")
@@ -193,7 +197,8 @@ assert_clean_patch "$plain_patch"
 
 selected_plain_output="$(
   cd "$fixture"
-  "$HARNESS" selected --task "Selected normalization smoke." \
+  "$HARNESS" selected --task-id "$SMOKE_TASK_ID" \
+    --task "Selected normalization smoke." \
     --plain --prepare-only -- dir/./file.txt
 )"
 selected_plain="$(prepared_artifact "$selected_plain_output")"
@@ -244,7 +249,7 @@ fi
   || die "symlink validation altered its sentinel target"
 
 if private_command_output="$(
-  "$HARNESS" __validate-output-dir "$cleanup_carrier" 2>&1
+  WEB_REVIEW_TEST_MODE=0 "$HARNESS" __validate-output-dir "$cleanup_carrier" 2>&1
 )"; then
   die "ordinary CLI invocation accepted a private test command"
 fi
@@ -257,7 +262,7 @@ PATH=/nonexistent "$HARNESS" --help >/dev/null \
 populate_fake_bin "$fake_bin"
 no_surf_output="$(
   cd "$fixture"
-  PATH="$fake_bin" "$HARNESS" selected \
+  PATH="$fake_bin" "$HARNESS" selected --task-id "$SMOKE_TASK_ID" \
     --task "Prepare without Surf." --plain --prepare-only -- safe.txt
 )"
 no_surf_artifact="$(prepared_artifact "$no_surf_output")"
@@ -267,12 +272,13 @@ artifacts+=("$no_surf_artifact")
 
 if ui_model_output="$(
   cd "$fixture"
-  "$HARNESS" diff --base HEAD --task "Transport validation smoke." \
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base HEAD \
+    --task "Transport validation smoke." \
     --model smoke-model --prepare-only 2>&1
 )"; then
   die "UI transport unexpectedly accepted --model"
 fi
-[[ "$ui_model_output" == *"--model is valid only with --transport api"* ]] \
+[[ "$ui_model_output" == *"--model was removed"* ]] \
   || die "UI transport model rejection was not clear"
 
 git -C "$deletion_fixture" init -q
@@ -294,7 +300,7 @@ rm -f -- "$deletion_fixture/unstaged-delete.txt"
 
 deletion_output="$(
   cd "$deletion_fixture"
-  "$HARNESS" diff --base "$deletion_base" \
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base "$deletion_base" \
     --task "Three-layer deletion smoke." --prepare-only
 )"
 deletion_archive="$(prepared_artifact "$deletion_output")"
@@ -330,7 +336,7 @@ print -r -- "$SENTINEL" > "$rename_fixture/.config.yaml"
 
 rename_output="$(
   cd "$rename_fixture"
-  "$HARNESS" diff --base HEAD \
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base HEAD \
     --task "Safe-to-excluded rename smoke." --prepare-only
 )"
 rename_archive="$(prepared_artifact "$rename_output")"
@@ -366,7 +372,7 @@ rm -f -- "$overlap_fixture/overlap.txt"
 
 overlap_output="$(
   cd "$overlap_fixture"
-  "$HARNESS" diff --base "$overlap_base" \
+  "$HARNESS" diff --task-id "$SMOKE_TASK_ID" --base "$overlap_base" \
     --task "Overlapping deletion smoke." --prepare-only
 )"
 overlap_archive="$(prepared_artifact "$overlap_output")"
@@ -392,7 +398,8 @@ print -r -- "directory child" > "$inventory_fixture/replace-me/inside.txt"
 
 inventory_output="$(
   cd "$inventory_fixture"
-  "$HARNESS" repo --task "Inventory counter smoke." --prepare-only
+  "$HARNESS" repo --task-id "$SMOKE_TASK_ID" \
+    --task "Inventory counter smoke." --prepare-only
 )"
 inventory_archive="$(prepared_artifact "$inventory_output")"
 artifacts+=("$inventory_archive")
@@ -423,7 +430,8 @@ if mutation_output="$(
   WEB_REVIEW_SMOKE_REAL_TAR="$REAL_TAR_PATH" \
   WEB_REVIEW_SMOKE_MUTATE="$mutation_fixture/tracked.txt" \
   WEB_REVIEW_SMOKE_TAR_MARKER="$mutation_marker" \
-    "$HARNESS" repo --task "Mutation cleanup smoke." --prepare-only 2>&1
+    "$HARNESS" repo --task-id "$SMOKE_TASK_ID" \
+      --task "Mutation cleanup smoke." --prepare-only 2>&1
 )"; then
   die "repository mutation during packaging unexpectedly succeeded"
 fi
@@ -457,7 +465,8 @@ if artifact_output="$(
   WEB_REVIEW_SMOKE_REAL_CP="$REAL_CP_PATH" \
   WEB_REVIEW_SMOKE_OUTPUT_ROOT="$artifact_temp" \
   WEB_REVIEW_SMOKE_CP_LINK_TARGET="$artifact_fixture/selected.txt" \
-    "$HARNESS" selected --task "Final artifact type smoke." \
+    "$HARNESS" selected --task-id "$SMOKE_TASK_ID" \
+      --task "Final artifact type smoke." \
       --plain --prepare-only -- selected.txt 2>&1
 )"; then
   die "selected --plain accepted a final symlink artifact"

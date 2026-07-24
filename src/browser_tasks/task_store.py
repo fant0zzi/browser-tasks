@@ -18,7 +18,12 @@ from .authorization import validate_grant
 
 
 TASK_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9][a-z0-9-]*$")
-POLICIES = {"off", "suggest", "auto_readonly", "force"}
+POLICIES = {"off", "suggest", "auto_readonly", "force", "maximal"}
+BROWSER_POLICIES = {"user_browser_only"}
+REASONING_EFFORTS = {"best", "high", "max"}
+DEEP_RESEARCH_POLICIES = {"auto", "standard", "deep"}
+FALLBACK_POLICIES = {"block"}
+EXTERNAL_TOOL_POLICIES = {"surf_chatgpt_only"}
 
 
 class TaskStore:
@@ -50,7 +55,17 @@ class TaskStore:
             raise ValueError("task escapes tasks root")
         return path
 
-    def create(self, task_id: str, goal: str, constraints: tuple[str, ...] = ()) -> Task:
+    def create(
+        self,
+        task_id: str,
+        goal: str,
+        constraints: tuple[str, ...] = (),
+        *,
+        delegation_policy: str = "maximal",
+        allowed_browser_adapters: tuple[str, ...] = ("surf",),
+        reasoning_effort: str = "best",
+        deep_research_policy: str = "auto",
+    ) -> Task:
         final = self.path(task_id)
         self.tasks.mkdir(mode=0o700, parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix=f".{task_id}.", dir=self.tasks))
@@ -58,8 +73,17 @@ class TaskStore:
         try:
             for name in ("artifacts", "evidence", "delegations"):
                 (stage / name).mkdir(mode=0o700)
-            task = Task(task_id=task_id, goal=goal, constraints=constraints,
-                        created_at=datetime.now(UTC).isoformat(), state=TaskState.SCOPED)
+            task = Task(
+                task_id=task_id,
+                goal=goal,
+                constraints=constraints,
+                delegation_policy=delegation_policy,
+                allowed_browser_adapters=allowed_browser_adapters,
+                reasoning_effort=reasoning_effort,
+                deep_research_policy=deep_research_policy,
+                created_at=datetime.now(UTC).isoformat(),
+                state=TaskState.SCOPED,
+            )
             self._write_json(stage / "task.json", task.to_dict())
             for name, text in (("request.md", f"# Request\n\n{goal}\n"), ("notes.md", "# Notes\n"),
                                ("result.md", "# Result\n\nWork in progress.\n"), ("events.jsonl", ""),
@@ -81,17 +105,79 @@ class TaskStore:
         required = {"schema_version", "task_id", "goal", "created_at", "state"}
         if not required.issubset(data) or data["schema_version"] != SCHEMA_VERSION:
             raise ValueError("invalid task schema")
-        if data["task_id"] != requested or data.get("delegation_policy", "suggest") not in POLICIES:
+        delegation_policy = data.get("delegation_policy", "maximal")
+        browser_policy = data.get("browser_policy", "user_browser_only")
+        reasoning_effort = data.get("reasoning_effort", "best")
+        deep_research_policy = data.get("deep_research_policy", "auto")
+        fallback_policy = data.get("fallback_policy", "block")
+        external_tool_policy = data.get(
+            "external_tool_policy", "surf_chatgpt_only"
+        )
+        delegate_provider = data.get("delegate_provider", "chatgpt-web")
+        delegate_transport = data.get("delegate_transport", "surf-ui")
+        allowed_adapters = tuple(data.get("allowed_browser_adapters", ["surf"]))
+        if (
+            data["task_id"] != requested
+            or delegation_policy not in POLICIES
+            or browser_policy not in BROWSER_POLICIES
+            or reasoning_effort not in REASONING_EFFORTS
+            or deep_research_policy not in DEEP_RESEARCH_POLICIES
+            or fallback_policy not in FALLBACK_POLICIES
+            or external_tool_policy not in EXTERNAL_TOOL_POLICIES
+            or delegate_provider != "chatgpt-web"
+            or delegate_transport != "surf-ui"
+            or not allowed_adapters
+            or any(item != "surf" for item in allowed_adapters)
+        ):
             raise ValueError("task identity or policy mismatch")
         created = datetime.fromisoformat(data["created_at"])
         if created.tzinfo is None:
             raise ValueError("created_at must be timezone-aware")
         return Task(task_id=requested, goal=str(data["goal"]), created_at=data["created_at"],
                     state=TaskState(data["state"]), constraints=tuple(data.get("constraints", [])),
-                    delegation_policy=data.get("delegation_policy", "suggest"),
+                    delegation_policy=delegation_policy,
                     authorization_policy=data.get("authorization_policy", "explicit"),
+                    browser_policy=browser_policy,
+                    allowed_browser_adapters=allowed_adapters,
+                    delegate_provider=delegate_provider,
+                    delegate_transport=delegate_transport,
+                    reasoning_effort=reasoning_effort,
+                    deep_research_policy=deep_research_policy,
+                    fallback_policy=fallback_policy,
+                    external_tool_policy=external_tool_policy,
                     active_browser_adapter=data.get("active_browser_adapter"),
                     owned_browser_resources=tuple(data.get("owned_browser_resources", [])))
+
+    def enforce_delegate_first_policy(self) -> Task:
+        with self._lock():
+            task = self.load()
+            changed = replace(
+                task,
+                delegation_policy="maximal",
+                browser_policy="user_browser_only",
+                allowed_browser_adapters=("surf",),
+                delegate_provider="chatgpt-web",
+                delegate_transport="surf-ui",
+                reasoning_effort="best",
+                deep_research_policy="auto",
+                fallback_policy="block",
+                external_tool_policy="surf_chatgpt_only",
+            )
+            self._write_json(self.path() / "task.json", changed.to_dict())
+        self.append_event(
+            "task.policy_enforced",
+            {
+                "delegation_policy": "maximal",
+                "browser_adapter": "surf",
+                "provider": "chatgpt-web",
+                "transport": "surf-ui",
+                "reasoning_effort": "best",
+                "deep_research_policy": "auto",
+                "fallback_policy": "block",
+                "external_tool_policy": "surf_chatgpt_only",
+            },
+        )
+        return changed
 
     def transition(self, expected: TaskState, target: TaskState, *, verified: bool = False) -> Task:
         with self._lock():
@@ -105,10 +191,13 @@ class TaskStore:
         return changed
 
     def bind_adapter(self, adapter_id: str, resources: tuple[str, ...]) -> Task:
+        from .policy import ensure_browser_adapter_allowed
+
         if not resources or any(not item for item in resources):
             raise ValueError("adapter must claim resources")
         with self._lock():
             task = self.load()
+            ensure_browser_adapter_allowed(task, adapter_id)
             if task.active_browser_adapter and task.active_browser_adapter != adapter_id:
                 raise ValueError("adapter mismatch")
             changed = replace(task, active_browser_adapter=adapter_id, owned_browser_resources=tuple(resources))
