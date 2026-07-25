@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .models import ActionClass, Task
+from .models import ActionClass, Task, TaskState
 
 
 CONSEQUENTIAL = {
@@ -41,6 +41,22 @@ EXTERNAL_CAPABILITY_TOOLS = {
     "reasoning": {"web-chat", "web-review"},
     "research": {"web-chat", "web-review"},
 }
+
+
+RETIRED_TASK_STATES = {TaskState.CANCELLED, TaskState.SUPERSEDED}
+
+
+def ensure_task_is_operable(task: Task, metadata: dict) -> None:
+    """A guard must answer for this workspace, not only for the tool name."""
+
+    if metadata.get("archived_at"):
+        raise PermissionError(
+            "workspace is archived; restore it before external actions"
+        )
+    if task.state in RETIRED_TASK_STATES:
+        raise PermissionError(
+            f"workspace is {task.state.value}; external actions are not allowed"
+        )
 
 
 def ensure_external_tool_allowed(

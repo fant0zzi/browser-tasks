@@ -7,7 +7,7 @@ export WEB_REVIEW_TEST_MODE=1
 
 readonly SCRIPT_DIR="${0:A:h}"
 readonly HARNESS="$SCRIPT_DIR/web-review.zsh"
-readonly SMOKE_TASK_ID="20260724-120000-web-review-smoke"
+readonly SMOKE_TASK_ID="web-review-smoke"
 readonly SENTINEL="FORBIDDEN_SENTINEL_WEB_REVIEW_7f91a3"
 readonly HOSTILE_PATH=':(glob)**'
 readonly REAL_TAR_PATH="$(command -v tar)"
@@ -15,6 +15,13 @@ readonly REAL_CP_PATH="$(command -v cp)"
 smoke_tmp_root="${TMPDIR:-/tmp}"
 readonly SMOKE_TMP_ROOT="${smoke_tmp_root:A}"
 unset smoke_tmp_root
+
+smoke_workspace_root="$(mktemp -d "$SMOKE_TMP_ROOT/web-review-workspace.XXXXXX")"
+export WEB_REVIEW_WORKSPACE_ROOT="$smoke_workspace_root"
+PYTHONPATH="${SCRIPT_DIR:h:h}/src${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m browser_tasks.cli --root "$smoke_workspace_root" \
+  task init "$SMOKE_TASK_ID" \
+  --goal "Exercise the repository review packer against fixtures" >/dev/null
 
 fixture="$(mktemp -d "$SMOKE_TMP_ROOT/web-review-smoke.XXXXXX")"
 deletion_fixture="$(mktemp -d "$SMOKE_TMP_ROOT/web-review-deletions.XXXXXX")"
@@ -50,6 +57,7 @@ cleanup() {
     "$inventory_fixture" "$mutation_fixture" "$artifact_fixture" \
     "$mutation_temp" "$artifact_temp" "$unpacked" "$fake_bin" \
     "$mutation_bin" "$artifact_bin" "$mutation_marker" \
+    "$smoke_workspace_root" \
     "$cleanup_carrier" "$cleanup_sentinel" "$cleanup_symlink"; do
     [[ -n "$cleanup_path" ]] && rm -rf -- "$cleanup_path"
   done
@@ -84,7 +92,8 @@ prepared_artifact() {
 populate_fake_bin() {
   local target_bin="$1" omitted="${2:-}" command_name
   mkdir -p -- "$target_bin"
-  for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc tr date sed base64; do
+  for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc \
+    tr date sed base64 find touch sort head grep python3; do
     [[ "$command_name" == "$omitted" ]] && continue
     ln -s -- "$(command -v "$command_name")" "$target_bin/$command_name"
   done
@@ -99,12 +108,20 @@ assert_clean_patch() {
     || die "forbidden filename leaked into $patch"
 }
 
+file_mode() {
+  # BSD and GNU stat disagree; the suite claims Linux support, so detect.
+  if stat -f '%Lp' "$1" 2>/dev/null; then
+    return 0
+  fi
+  stat -c '%a' "$1"
+}
+
 assert_private_output() {
   local artifact="$1" checked_file mode
-  [[ "$(stat -f '%Lp' "${artifact:h}")" == "700" ]] \
+  [[ "$(file_mode "${artifact:h}")" == "700" ]] \
     || die "output directory is not mode 700"
   for checked_file in "$artifact" "${artifact}.receipt.txt"; do
-    mode="$(stat -f '%Lp' "$checked_file")"
+    mode="$(file_mode "$checked_file")"
     [[ "$mode" == *00 ]] \
       || die "group/other permissions present on $checked_file ($mode)"
   done
@@ -259,6 +276,15 @@ fi
 
 PATH=/nonexistent "$HARNESS" --help >/dev/null \
   || die "--help required external commands"
+if (
+  cd "$fixture"
+  "$HARNESS" selected \
+    --task-id 20260724-120000-review \
+    --task "Timestamp ids must be rejected." \
+    --plain --prepare-only -- safe.txt >/dev/null 2>&1
+); then
+  die "timestamp-shaped review task id unexpectedly succeeded"
+fi
 populate_fake_bin "$fake_bin"
 no_surf_output="$(
   cd "$fixture"
@@ -477,5 +503,161 @@ fi
 artifact_outputs=("$artifact_temp"/web-review-output.*(N))
 [[ ${#artifact_outputs[@]} -eq 0 ]] \
   || die "final artifact rejection left a private output directory behind"
+
+delegate_context_sha() {
+  local output="$1" line
+  for line in ${(f)output}; do
+    [[ "$line" == "Context SHA-256: "* ]] && {
+      print -r -- "${line#Context SHA-256: }"
+      return
+    }
+  done
+  return 1
+}
+
+# The two-phase approval must converge: prepare prints a hash, and the live
+# rerun has to compute the same one. It could not before the archive was made
+# reproducible, so the documented workflow never terminated.
+gate_fixture="$(mktemp -d "$SMOKE_TMP_ROOT/web-review-gate.XXXXXX")"
+gate_bin="${gate_fixture}.bin"
+gate_log="${gate_fixture}.surf.log"
+git -C "$gate_fixture" init -q
+git -C "$gate_fixture" config user.email smoke@example.test
+git -C "$gate_fixture" config user.name "Smoke Runner"
+print -r -- "module contents" > "$gate_fixture/module.py"
+git -C "$gate_fixture" add module.py
+git -C "$gate_fixture" commit -qm "test: gate fixture"
+populate_fake_bin "$gate_bin"
+print -r -- '#!/bin/zsh
+print -r -- "$*" >> "$WEB_REVIEW_SMOKE_SURF_LOG"
+if [[ "$1" == "tab.new" ]]; then
+  print -r -- "Created tab 7: ChatGPT"
+  exit 0
+fi
+if [[ "$1" == "--tab-id" ]]; then
+  shift 2
+fi
+case "$1" in
+  wait|click|upload|key) exit 0 ;;
+  page.read)
+    print -r -- '"'"'button "High" [e1]'"'"'
+    print -r -- '"'"'button "Send prompt" [e2]'"'"'
+    print -r -- '"'"'button "Browser Tasks upload proxy" [e3]'"'"'
+    exit 0
+    ;;
+  locate.text)
+    [[ "$2" == "Max" ]] && exit 1
+    exit 0
+    ;;
+  locate.role) exit 0 ;;
+  js)
+    code="$2"
+    if [[ "$code" == *"CHATGPT_READY"* ]]; then
+      print -r -- "CHATGPT_READY"
+    elif [[ "$code" == *"PILL_NOT_FOUND"* ]]; then
+      print -r -- "PILL:High"
+    elif [[ "$code" == *"PROXY_READY"* ]]; then
+      print -r -- "PROXY_READY"
+    elif [[ "$code" == *"UPLOAD_READY"* ]]; then
+      print -r -- "UPLOAD_READY"
+    elif [[ "$code" == *"BASELINE_READY"* ]]; then
+      print -r -- "BASELINE_READY"
+    elif [[ "$code" == *"STANDARD_RESEARCH_ACTIVE"* ]]; then
+      print -r -- "STANDARD_RESEARCH_ACTIVE"
+    elif [[ "$code" == *"SUBMITTED"* ]]; then
+      print -r -- "SUBMITTED"
+    elif [[ "$code" == *"TextEncoder"* ]]; then
+      print -r -- "COMPLETE:cmV2aWV3IHJlc3BvbnNl"
+    elif [[ "$code" == *"window.location.href"* ]]; then
+      print -r -- "https://chatgpt.com/c/fake"
+    else
+      print -r -- "READY"
+    fi
+    exit 0
+    ;;
+esac
+print -u2 -r -- "unexpected fake Surf command: $*"
+exit 1
+' > "$gate_bin/surf"
+chmod +x "$gate_bin/surf"
+
+typeset -a gate_common
+gate_common=(
+  repo
+  --task-id "$SMOKE_TASK_ID"
+  --task "Gate convergence smoke."
+)
+first_gate="$(cd "$gate_fixture" && "$HARNESS" "${gate_common[@]}" --prepare-only)"
+second_gate="$(cd "$gate_fixture" && "$HARNESS" "${gate_common[@]}" --prepare-only)"
+artifacts+=("$(prepared_artifact "$first_gate")" "$(prepared_artifact "$second_gate")")
+first_gate_sha="$(delegate_context_sha "$first_gate")"
+second_gate_sha="$(delegate_context_sha "$second_gate")"
+[[ -n "$first_gate_sha" && "$first_gate_sha" == "$second_gate_sha" ]] \
+  || die "archive-mode context hash is not reproducible across preparations"
+
+gate_run="$(
+  PYTHONPATH="${SCRIPT_DIR:h:h}/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m browser_tasks.cli --root "$smoke_workspace_root" \
+    task run-start "$SMOKE_TASK_ID" --lease-owner smoke \
+    | sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p'
+)"
+[[ -n "$gate_run" ]] || die "could not start a run for the live gate check"
+live_gate="$(
+  cd "$gate_fixture"
+  PATH="$gate_bin" WEB_REVIEW_SMOKE_SURF_LOG="$gate_log" \
+    WEB_CHAT_SMOKE_LOG="$gate_log" \
+    "$HARNESS" "${gate_common[@]}" \
+      --record-run-id "$gate_run" --record-lease-owner smoke \
+      --approved-context-sha "$first_gate_sha"
+)"
+artifacts+=("$(prepared_artifact "$live_gate")")
+[[ "$live_gate" == *"Completed ChatGPT Web delegation"* ]] \
+  || die "live submission did not accept the approved context hash"
+
+# A symlink must be excluded rather than packaged, and every omission named.
+ln -s -- /etc/hosts "$gate_fixture/link.txt"
+print -r -- "kept contents" > "$gate_fixture/keeper.py"
+git -C "$gate_fixture" add link.txt keeper.py
+git -C "$gate_fixture" commit -qm "test: add symlink and keeper"
+rm -f -- "$gate_fixture/module.py"
+symlink_output="$(cd "$gate_fixture" && "$HARNESS" "${gate_common[@]}" --prepare-only)"
+symlink_artifact="$(prepared_artifact "$symlink_output")"
+artifacts+=("$symlink_artifact")
+symlink_unpacked="${gate_fixture}.unpacked"
+mkdir -p -- "$symlink_unpacked"
+zstd -q -dc -- "$symlink_artifact" | tar -xf - -C "$symlink_unpacked"
+[[ ! -e "$symlink_unpacked/repository/link.txt" ]] \
+  || die "symlink entered the review payload"
+grep -q 'link.txt' "$symlink_unpacked/manifest/excluded.txt" \
+  || die "excluded symlink was not recorded"
+grep -q 'module.py' "$symlink_unpacked/manifest/missing.txt" \
+  || die "missing tracked path was not named in the manifest"
+grep -q '^missing_1=module.py$' "${symlink_artifact}.receipt.txt" \
+  || die "missing tracked path was not named in the receipt"
+
+# A secret under a benign filename must block packaging until it is approved.
+print -r -- 'api_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"' > "$gate_fixture/config.py"
+git -C "$gate_fixture" add config.py
+git -C "$gate_fixture" commit -qm "test: add secret"
+if secret_output="$(
+  cd "$gate_fixture"
+  "$HARNESS" "${gate_common[@]}" --prepare-only 2>&1
+)"; then
+  die "context carrying a secret was packaged without approval"
+fi
+[[ "$secret_output" == *"unapproved disclosure finding: api_token config.py"* ]] \
+  || die "disclosure scan did not name the finding"
+approved_output="$(
+  cd "$gate_fixture"
+  "$HARNESS" "${gate_common[@]}" --prepare-only \
+    --allow-finding "config.py:api_token"
+)"
+approved_artifact="$(prepared_artifact "$approved_output")"
+artifacts+=("$approved_artifact")
+grep -q '^approved_finding_1=config.py:api_token$' \
+  "${approved_artifact}.receipt.txt" \
+  || die "approved finding was not recorded in the receipt"
+
+rm -rf -- "$gate_fixture" "$gate_bin" "$gate_log" "$symlink_unpacked"
 
 print -r -- "web-review smoke: PASS"

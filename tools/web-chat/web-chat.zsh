@@ -5,6 +5,7 @@ setopt errexit nounset pipefail
 umask 077
 
 readonly PROGRAM="${0:t}"
+readonly SCRIPT_DIR="${0:A:h}"
 temp_root="${TMPDIR:-/tmp}"
 readonly SYSTEM_TMP_ROOT="${temp_root:A}"
 unset temp_root
@@ -30,6 +31,12 @@ Policy:
 Disclosure:
   --prepare-only           Freeze prompt and print the exact context SHA-256.
   --approved-context-sha H Execute only when H matches the prepared context.
+  --workspace-root DIR     Root holding tasks/ (default: this repository).
+  --record-run-id RUN      Store receipt and response under that run; required live.
+  --record-lease-owner OWNER
+                           Lease owner of the recording run when it is active.
+  --scan-receipt FILE      Packer scan attestation, verified against the digest.
+  --keep                   Keep the private output directory after the run.
 
 The transport and provider are fixed to Surf UI and ChatGPT Web. The command
 never falls back to an API, another browser, a local model, or another search
@@ -38,6 +45,9 @@ provider. A live submission requires an exact approved context SHA-256.
 }
 
 fail() {
+  # Keep the private material on failure: it holds the tab id and the frozen
+  # prompt an operator needs to reconcile a half-finished disclosure.
+  keep_output=1
   print -u2 -r -- "$PROGRAM: $*"
   exit 1
 }
@@ -45,6 +55,37 @@ fail() {
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
+
+readonly REPO_ROOT="${SCRIPT_DIR:h:h}"
+
+browser_tasks_cli() {
+  PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m browser_tasks.cli "$@"
+}
+
+prune_stale_output_dirs() {
+  # Every run used to leave the prompt, the attachment digest and the full
+  # response in the system temp directory forever.
+  find "$SYSTEM_TMP_ROOT" -maxdepth 1 -type d -name 'web-chat-output.*' \
+    -mtime +7 -exec rm -rf -- {} + 2>/dev/null || true
+}
+
+keep_output=0
+private_output_dir=""
+
+cleanup_private_output() {
+  [[ -n "$private_output_dir" && -d "$private_output_dir" ]] || return 0
+  if (( keep_output )); then
+    print -r -- "Retained private output: $private_output_dir"
+    return 0
+  fi
+  rm -rf -- "$private_output_dir"
+}
+# A returning zsh trap resumes execution, so INT/TERM must exit rather than
+# clean up and keep polling with the directory already removed.
+trap cleanup_private_output EXIT
+trap 'keep_output=1; exit 130' INT
+trap 'keep_output=1; exit 143' TERM
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -71,17 +112,80 @@ validate_chat_url() {
 }
 
 validate_attachment() {
-  local path="$1" basename="${1:t}"
-  [[ -f "$path" && ! -L "$path" ]] \
+  # `path` is tied to `PATH` in zsh; a local of that name corrupts lookup.
+  local candidate="$1" canonical lowered component
+  [[ -f "$candidate" && ! -L "$candidate" ]] \
     || fail "attachment must be a regular non-symlink file"
-  [[ "$path" != */tasks/* && "$path" != tasks/* ]] \
-    || fail "task directories cannot be uploaded; use a frozen disclosure artifact"
-  [[ "$basename" != ".env" && "$basename" != .env.* ]] \
-    || fail "environment files cannot be uploaded"
-  [[ "$basename" != ".config.yaml" && "$basename" != ".config.yml" ]] \
-    || fail "configuration secret files cannot be uploaded"
-  [[ "$basename" != *.pem && "$basename" != *.key ]] \
-    || fail "key material cannot be uploaded"
+  # Canonicalize first: the literal argument string can point into tasks/ or
+  # archive/ through a symlinked parent and still pass a textual test.
+  canonical="${candidate:A}"
+  local -a components
+  components=("${(@s:/:)canonical}")
+  local walked=""
+  for component in "${components[@]}"; do
+    [[ -z "$component" ]] && continue
+    walked="$walked/$component"
+    [[ -L "$walked" ]] \
+      && fail "attachment path component is a symlink: $walked"
+  done
+  lowered="${canonical:l}"
+  [[ "$lowered" != */tasks/* && "$lowered" != */archive/* ]] \
+    || fail "task and archive directories cannot be uploaded; use a frozen disclosure artifact"
+  local basename="${canonical:t:l}"
+  case "$basename" in
+    .env|.env.*)
+      [[ "$basename" == ".env.example" ]] \
+        || fail "environment files cannot be uploaded"
+      ;;
+    .config.yaml|.config.yml|.netrc|.npmrc|.pypirc|.git-credentials)
+      fail "configuration secret files cannot be uploaded"
+      ;;
+    id_*)
+      fail "key material cannot be uploaded"
+      ;;
+    *.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|*.p8|*.ppk|*.kdbx)
+      fail "key material cannot be uploaded"
+      ;;
+  esac
+  if [[ -n "$scan_receipt" ]]; then
+    # The packer's claim is authenticated against the artifact digest rather
+    # than trusted from a flag, and the receipt itself enters the approved
+    # context hash below.
+    verify_scan_receipt "$canonical"
+    return 0
+  fi
+  scan_disclosure_path "${canonical:h}" "${canonical:t}"
+}
+
+verify_scan_receipt() {
+  local artifact="$1" recorded computed
+  [[ -f "$scan_receipt" && ! -L "$scan_receipt" ]] \
+    || fail "scan receipt must be a regular non-symlink file"
+  recorded="$(
+    awk -F= '$1 == "artifact_sha256" { print $2; exit }' "$scan_receipt"
+  )"
+  [[ -n "$recorded" ]] || fail "scan receipt does not record an artifact digest"
+  computed="$(sha256_file "$artifact")"
+  [[ "$recorded" == "$computed" ]] \
+    || fail "scan receipt covers a different artifact: $recorded != $computed"
+  grep -q '^scan=clean$' "$scan_receipt" \
+    || fail "scan receipt does not attest a clean scan"
+}
+
+scan_disclosure_path() {
+  # Content scanning is a hard disclosure requirement, not a filename check.
+  local root="$1" relative="$2" findings
+  integer scan_status=0
+  require_command python3
+  findings="$(browser_tasks_cli scan --repo-root "$root" -- "$relative" 2>&1)" \
+    && scan_status=0 || scan_status=$?
+  (( scan_status == 0 )) && return 0
+  # 5 means findings; anything else means the scan could not run, which must
+  # never read as clean. The `--` above stops a name such as `--help` from
+  # being parsed as an option and exiting 0.
+  (( scan_status == 5 )) \
+    || fail "disclosure scan could not run for $relative:"$'\n'"$findings"
+  fail "disclosure scan rejected $relative:"$'\n'"$findings"
 }
 
 task_id=""
@@ -96,6 +200,10 @@ timeout_seconds=2700
 response_out=""
 prepare_only=0
 approved_context_sha=""
+workspace_root="${WEB_CHAT_WORKSPACE_ROOT:-$REPO_ROOT}"
+scan_receipt=""
+record_run_id=""
+record_lease_owner=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -154,6 +262,30 @@ while [[ $# -gt 0 ]]; do
       approved_context_sha="$2"
       shift 2
       ;;
+    --workspace-root)
+      [[ $# -ge 2 ]] || fail "--workspace-root requires a value"
+      workspace_root="$2"
+      shift 2
+      ;;
+    --record-run-id)
+      [[ $# -ge 2 ]] || fail "--record-run-id requires a value"
+      record_run_id="$2"
+      shift 2
+      ;;
+    --record-lease-owner)
+      [[ $# -ge 2 ]] || fail "--record-lease-owner requires a value"
+      record_lease_owner="$2"
+      shift 2
+      ;;
+    --scan-receipt)
+      [[ $# -ge 2 ]] || fail "--scan-receipt requires a value"
+      scan_receipt="$2"
+      shift 2
+      ;;
+    --keep)
+      keep_output=1
+      shift
+      ;;
     --prepare-only)
       prepare_only=1
       shift
@@ -168,7 +300,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$task_id" =~ '^[0-9]{8}-[0-9]{6}-[a-z0-9][a-z0-9-]*$' ]] \
+[[ "$task_id" =~ '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$' ]] \
+  && [[ ! "$task_id" =~ '^[0-9]{8}-[0-9]{6}($|-)' ]] \
   || fail "invalid or missing --task-id"
 [[ -z "$task_text" || -z "$task_file" ]] \
   || fail "use either --task or --task-file, not both"
@@ -188,14 +321,33 @@ fi
 validate_chat_url "$chat_url"
 [[ -z "$attachment" ]] || validate_attachment "$attachment"
 if [[ -n "$response_out" ]]; then
-  [[ ! -e "$response_out" ]] || fail "response output already exists"
+  # `-e` is false for a dangling symlink, which would redirect both the copy
+  # and the chmod to the link target.
+  [[ ! -e "$response_out" && ! -L "$response_out" ]] \
+    || fail "response output already exists"
   [[ -d "${response_out:h}" ]] || fail "response output directory does not exist"
 fi
 
-for dependency in mktemp chmod shasum awk wc tr date sed base64; do
+for dependency in mktemp chmod shasum awk wc tr date sed base64 find cat grep python3; do
   require_command "$dependency"
 done
 
+(( prepare_only )) || [[ -n "$record_run_id" ]] \
+  || fail "a live submission requires --record-run-id so the disclosure is recorded in the workspace"
+
+# The guard is the mandatory pre-flight for any external action, and a denial
+# is terminal for this route.
+guard_capability=research
+[[ "$purpose" == research ]] || guard_capability=reasoning
+guard_output="$(
+  browser_tasks_cli --root "$workspace_root" guard "$task_id" \
+    --capability "$guard_capability" --tool web-chat 2>&1
+)" || fail "task guard denied web-chat for $task_id:"$'\n'"$guard_output"
+# Do not rely on the exit status alone.
+[[ "$guard_output" == *'"allowed": true'* ]] \
+  || fail "task guard did not allow web-chat for $task_id:"$'\n'"$guard_output"
+
+prune_stale_output_dirs
 private_output_dir="$(mktemp -d "$SYSTEM_TMP_ROOT/web-chat-output.XXXXXX")"
 chmod 700 "$private_output_dir"
 request_seed_file="$private_output_dir/request-seed.txt"
@@ -235,19 +387,29 @@ receipt_file="$private_output_dir/${request_id}.receipt.txt"
   print -r -- ""
   print -r -- "## Task"
   print -r -- "$task_text"
+  print -r -- ""
+  # End sentinel: the composer check requires it, so a truncated paste cannot
+  # pass verification just because the leading metadata arrived.
+  print -r -- "<!-- end-of-request $request_id -->"
 } > "$prompt_file"
 chmod 600 "$prompt_file"
+
+# Operator-supplied text is disclosed too; scanning only attachments left the
+# one input the gate never saw.
+scan_disclosure_path "$private_output_dir" "${prompt_file:t}"
 
 prompt_sha="$(sha256_file "$prompt_file")"
 prompt_bytes="$(file_bytes "$prompt_file")"
 attachment_sha="none"
 attachment_bytes=0
 attachment_name="none"
+scan_receipt_sha="none"
 if [[ -n "$attachment" ]]; then
   attachment_sha="$(sha256_file "$attachment")"
   attachment_bytes="$(file_bytes "$attachment")"
   attachment_name="${attachment:t}"
 fi
+[[ -z "$scan_receipt" ]] || scan_receipt_sha="$(sha256_file "$scan_receipt")"
 
 {
   print -r -- "schema_version=1"
@@ -264,6 +426,9 @@ fi
   print -r -- "prompt_bytes=$prompt_bytes"
   print -r -- "attachment_sha256=$attachment_sha"
   print -r -- "attachment_bytes=$attachment_bytes"
+  # Inside the approved hash: an attachment accepted on a packer attestation
+  # must not be indistinguishable from one that was scanned directly.
+  print -r -- "scan_receipt_sha256=$scan_receipt_sha"
 } > "$manifest_file"
 chmod 600 "$manifest_file"
 context_sha="$(sha256_file "$manifest_file")"
@@ -276,6 +441,14 @@ context_sha="$(sha256_file "$manifest_file")"
 } > "$receipt_file"
 chmod 600 "$receipt_file"
 
+# Recorded unconditionally: `task audit` must show that context was frozen for
+# disclosure even when the run never submits.
+prepared_output="$(
+  browser_tasks_cli --root "$workspace_root" task delegation-prepared \
+    "$task_id" --request-id "$request_id" --purpose "$purpose" \
+    --context-sha256 "$context_sha" --destination "$chat_url" 2>&1
+)" || fail "could not record the prepared delegation:"$'\n'"$prepared_output"
+
 print -r -- "Prepared prompt: $prompt_file"
 print -r -- "Receipt:         $receipt_file"
 print -r -- "Context SHA-256: $context_sha"
@@ -284,7 +457,11 @@ print -r -- "Transport:       Surf UI (user browser)"
 print -r -- "Reasoning:       $reasoning"
 print -r -- "Research request: $research_mode"
 
-(( prepare_only )) && exit 0
+if (( prepare_only )); then
+  # The caller inspects the frozen prompt and receipt before approving.
+  keep_output=1
+  exit 0
+fi
 [[ "$approved_context_sha" == "$context_sha" ]] \
   || fail "live submission requires --approved-context-sha $context_sha"
 
@@ -295,6 +472,10 @@ tab_output="$(surf tab.new "$chat_url")"
 tab_id="${tab_output#Created tab }"
 tab_id="${tab_id%%:*}"
 [[ "$tab_id" == <-> ]] || fail "Surf returned an invalid tab id: $tab_id"
+# Recorded immediately: a tab opened by this run is a task-owned resource even
+# if the run later fails, and the operator needs its id to clean up.
+print -r -- "surf_tab_id=$tab_id" >> "$receipt_file"
+print -r -- "Surf tab: $tab_id"
 targeted_surf() {
   local subcommand="$1"
   shift
@@ -371,18 +552,27 @@ if [[ -z "$selected_reasoning" ]]; then
 fi
 [[ -n "$selected_reasoning" ]] \
   || fail "requested reasoning level is unavailable; no fallback was attempted"
-reasoning_state="$(targeted_surf js '
-  const pill = Array.from(document.querySelectorAll(
-    "button.__composer-pill[aria-haspopup=\"menu\"]"
-  )).find((node) => ["Max", "High", "Medium", "Low", "Standard"].includes(
-    (node.innerText || node.textContent || "").trim()
-  ));
-  return pill ? (pill.innerText || pill.textContent || "").trim() : "";
-')"
-reasoning_accessibility_state="$(targeted_surf page.read --all)"
-[[ "$reasoning_state" == *"\"$selected_reasoning\""* ||
-   "$reasoning_accessibility_state" == *"button \"$selected_reasoning\""* ]] \
-  || fail "could not verify selected reasoning level $selected_reasoning"
+# Close the selector before verifying. With the menu open the accessibility
+# tree contains a button for every level, so matching anywhere on the page
+# confirmed only that the option exists, not that it is selected.
+targeted_surf key Escape >/dev/null 2>&1 || true
+reasoning_state=""
+for attempt in {1..10}; do
+  reasoning_state="$(targeted_surf js '
+    const pill = Array.from(document.querySelectorAll(
+      "button.__composer-pill[aria-haspopup=\"menu\"]"
+    )).find((node) => ["Max", "High", "Medium", "Low", "Standard"].includes(
+      (node.innerText || node.textContent || "").trim()
+    ));
+    return pill
+      ? "PILL:" + (pill.innerText || pill.textContent || "").trim()
+      : "PILL_NOT_FOUND";
+  ')"
+  [[ "$reasoning_state" == *"PILL:$selected_reasoning"* ]] && break
+  targeted_surf wait 1 >/dev/null
+done
+[[ "$reasoning_state" == *"PILL:$selected_reasoning"* ]] \
+  || fail "selected reasoning level $selected_reasoning is not active on the composer pill"
 
 if [[ -n "$attachment" ]]; then
   proxy_state="$(targeted_surf js '
@@ -422,6 +612,12 @@ if [[ -n "$attachment" ]]; then
         }'
   )"
   [[ -n "$proxy_ref" ]] || fail "could not resolve the attachment input ref"
+  # Re-hash immediately before the upload: the digest was taken minutes ago and
+  # the path is caller-controlled, so unapproved bytes could be substituted in
+  # the window under an approved context hash.
+  upload_sha="$(sha256_file "$attachment")"
+  [[ "$upload_sha" == "$attachment_sha" ]] \
+    || fail "attachment changed after approval: expected $attachment_sha, found $upload_sha"
   targeted_surf upload --ref "$proxy_ref" --files "$attachment"
   attachment_ready=0
   for attempt in {1..120}; do
@@ -502,6 +698,7 @@ composer_mode_state() {
     if (!composer) return 'COMPOSER_NOT_FOUND';
     const text = (composer.innerText || composer.textContent || '').trim();
     if (!text.includes('$request_id')) return 'PROMPT_NOT_VERIFIED';
+    if (!text.includes('end-of-request $request_id')) return 'PROMPT_TRUNCATED';
     const deep = composer.querySelector(
       '[data-inline-selection-pill]' +
       '[data-id=\"plugin:connector_openai_deep_research\"]' +
@@ -537,8 +734,11 @@ for attempt in {1..120}; do
         ? composer.value
         : (composer ? composer.innerText || composer.textContent || '' : '');
       const newMessages = Number.isFinite(baseline) ? users.slice(baseline) : [];
-      const ownsRequest = newMessages.some((node) =>
-        (node.innerText || node.textContent || '').includes('$request_id'));
+      const ownsRequest = newMessages.some((node) => {
+        const body = node.innerText || node.textContent || '';
+        return body.includes('$request_id') &&
+          body.includes('end-of-request $request_id');
+      });
       return window.location.origin === 'https://chatgpt.com' &&
         window.location.pathname.includes('/c/') &&
         value.trim().length === 0 && ownsRequest
@@ -622,24 +822,47 @@ done
 response_sha="$(sha256_file "$response_file")"
 response_bytes="$(file_bytes "$response_file")"
 final_url="$(targeted_surf js 'return window.location.href')"
+observed_research_mode=standard
+[[ "$verified_mode_state" == *"DEEP_RESEARCH_ACTIVE"* ]] \
+  && observed_research_mode=deep
 {
   print -r -- "response_sha256=$response_sha"
   print -r -- "response_bytes=$response_bytes"
   print -r -- "selected_reasoning=$selected_reasoning"
-  print -r -- "verified_research_mode=$research_mode"
-  print -r -- "surf_tab_id=$tab_id"
+  # Derived from the observed composer state, not from the request.
+  print -r -- "verified_research_mode=$observed_research_mode"
   print -r -- "final_url=$final_url"
   print -r -- "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >> "$receipt_file"
+[[ "$observed_research_mode" == "$research_mode" ]] \
+  || fail "observed research mode $observed_research_mode does not match the request"
 
 if [[ -n "$response_out" ]]; then
-  command cp "$response_file" "$response_out"
+  # noclobber makes the create O_EXCL, which fails on an existing path or a
+  # planted dangling symlink instead of writing through it.
+  setopt localoptions noclobber
+  : > "$response_out" \
+    || fail "could not create the response output file: $response_out"
   chmod 600 "$response_out"
+  command cat -- "$response_file" >| "$response_out"
   response_file="$response_out"
 fi
+
+typeset -a record_args
+record_args=(
+  --receipt "$receipt_file"
+  --response "$response_file"
+)
+[[ -z "$record_lease_owner" ]] \
+  || record_args+=(--lease-owner "$record_lease_owner")
+record_output="$(
+  browser_tasks_cli --root "$workspace_root" task delegation-record \
+    "$task_id" "$record_run_id" "${record_args[@]}" 2>&1
+)" || fail "could not record the delegation in the workspace:"$'\n'"$record_output"
 
 print -r -- "Completed ChatGPT Web delegation"
 print -r -- "Surf tab:        $tab_id"
 print -r -- "Response:        $response_file"
 print -r -- "Response SHA-256: $response_sha"
 print -r -- "Receipt:         $receipt_file"
+print -r -- "Recorded:        run $record_run_id"

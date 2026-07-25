@@ -5,13 +5,20 @@ review through the canonical `tools/web-chat/web-chat.zsh` path.
 
 The only live provider and transport are ChatGPT Web and Surf UI in the user's
 browser. The removed `--transport api` and `--model` options are rejected.
-Reasoning defaults to `best`; Deep Research is opt-in when the deterministic
-router classifies the review as a research task.
+Reasoning defaults to `best`; `--research deep` is a manual opt-in, not a router
+decision.
+
+Before any packaging work the command runs the task-scoped guard
+(`browser_tasks.cli guard`) and stops unless it allows `web-review` for the given
+workspace. Use `--workspace-root` when the workspace lives outside this
+repository.
 
 ## Requirements
 
 - macOS or Linux with zsh
-- `git`, `tar`, `zstd`, `shasum`, and standard POSIX utilities
+- `git`, `tar`, `zstd`, `shasum`, `find`, `touch`, `sort`, `head`, `grep`, and
+  standard POSIX utilities
+- `python3` for the task guard and the content disclosure scan
 - Surf connected to the user's authenticated browser for a live run
 
 ## Two-phase usage
@@ -21,7 +28,7 @@ frozen repository artifact plus the final web-delegate disclosure:
 
 ```sh
 tools/web-review/web-review.zsh diff \
-  --task-id 20260724-120000-example \
+  --task-id harness-hardening \
   --base origin/main \
   --task "Review correctness, security, and missing validation." \
   --reasoning best \
@@ -40,7 +47,7 @@ After approving that exact final context SHA:
 
 ```sh
 tools/web-review/web-review.zsh diff \
-  --task-id 20260724-120000-example \
+  --task-id harness-hardening \
   --base origin/main \
   --task "Review correctness, security, and missing validation." \
   --reasoning best \
@@ -53,6 +60,9 @@ reasoning/research modes, uploads the frozen artifact, submits once, waits for
 completion, and saves the response and receipt. A missing mode, connection, or
 postcondition stops the run; there is no fallback.
 
+A live run requires `--record-run-id` (and `--record-lease-owner` when that run is
+active) so the receipt and response land under `.task/runs/<run-id>/`.
+
 ## Context modes
 
 - `repo`: tracked files plus non-ignored untracked files.
@@ -64,12 +74,12 @@ Examples:
 
 ```sh
 tools/web-review/web-review.zsh repo \
-  --task-id 20260724-120000-example \
+  --task-id harness-hardening \
   --task-file /tmp/review-task.md \
   --prepare-only
 
 tools/web-review/web-review.zsh selected \
-  --task-id 20260724-120000-example \
+  --task-id harness-hardening \
   --task "Review path safety." \
   --plain --prepare-only -- tools/web-review/web-review.zsh
 ```
@@ -84,14 +94,29 @@ temporary directory. Artifacts and receipts are mode `0600`.
 
 The packer:
 
-- excludes all `tasks/**`;
+- excludes all `tasks/**` and `archive/**`;
 - excludes `.env`, `.env.*` except `.env.example`, `.config.yaml`,
   `.config.yml`, `*.pem`, `*.key`, `.git` components, and AppleDouble files;
-- rejects traversal, symlinks, unsupported entries, and unsafe plain inputs;
-- records deleted, excluded, missing, and skipped submodule entries;
+- rejects traversal, unsupported entries, and unsafe plain inputs;
+- excludes symlinks from both the payload and the diff, recording them in
+  `manifest/excluded.txt` rather than disclosing their targets;
+- content-scans every packed file, the generated patch and the review task for
+  private keys, authorization and cookie headers, credentialed URLs, tokens and
+  binary payloads, failing the run on any finding that was not approved by name
+  with `--allow-finding PATH:KIND`;
+- names every missing tracked path in `manifest/missing.txt` and the receipt
+  instead of counting them anonymously;
+- records deleted, excluded, missing, approved-finding, and skipped submodule
+  entries, and the destination URL;
 - verifies archive payload and manifest equality;
 - fingerprints repository state before and after preparation and discards a
-  mixed snapshot if the source changes.
+  mixed snapshot if the source changes;
+- packs reproducibly — sorted entries, fixed timestamps in UTC, fixed ownership,
+  `ustar` format, single-threaded compression — so preparing the same tree twice
+  yields the same bytes and the same context SHA-256, which is what lets the
+  two-phase approval converge;
+- writes a scan attestation next to the artifact that the delegate verifies
+  against the artifact digest before accepting a packed archive.
 
 The web-chat delegate separately hashes the exact prompt and attachment. Live
 submission requires that final hash, not merely the repository artifact hash.

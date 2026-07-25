@@ -65,7 +65,7 @@ if [[ "$1" == "--tab-id" ]]; then
   shift 2
 fi
 case "$1" in
-  wait|click|upload)
+  wait|click|upload|key)
     exit 0
     ;;
   page.read)
@@ -92,6 +92,8 @@ case "$1" in
       else
         print -r -- "STANDARD_RESEARCH_ACTIVE"
       fi
+    elif [[ "$code" == *"PILL_NOT_FOUND"* ]]; then
+      print -r -- "PILL:${WEB_CHAT_SMOKE_PILL:-High}"
     elif [[ "$code" == *"BASELINE_READY"* ]]; then
       print -r -- "BASELINE_READY"
     elif [[ "$code" == *"SUBMITTED"* ]]; then
@@ -113,13 +115,75 @@ chmod +x "$fake_bin/surf"
 
 "$HARNESS" --help >/dev/null
 
+# The guard is a real precondition now, so the suite needs a real workspace.
+workspace_root="$smoke_root/workspace"
+mkdir -p "$workspace_root"
+browser_tasks_cli() {
+  PYTHONPATH="${SCRIPT_DIR:h:h}/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m browser_tasks.cli "$@"
+}
+browser_tasks_cli --root "$workspace_root" task init web-chat-smoke \
+  --goal "Exercise the web-chat delegate against a fake Surf" >/dev/null
+
+smoke_run_start() {
+  browser_tasks_cli --root "$workspace_root" task run-start web-chat-smoke \
+    --lease-owner smoke | sed -n 's/.*"run_id": "\([^"]*\)".*/\1/p'
+}
+
+smoke_run_finish() {
+  browser_tasks_cli --root "$workspace_root" task run-finish web-chat-smoke \
+    "$1" --lease-owner smoke --state SUCCEEDED >/dev/null
+}
+
+for legacy in 20260724-120000-smoke 20260724-120000; do
+  if "$HARNESS" \
+    --task-id "$legacy" \
+    --workspace-root "$workspace_root" \
+    --task "Timestamp ids must be rejected." \
+    --prepare-only >/dev/null 2>&1; then
+    die "timestamp-shaped task id unexpectedly succeeded: $legacy"
+  fi
+done
+
+if "$HARNESS" \
+  --task-id no-such-workspace \
+  --workspace-root "$workspace_root" \
+  --task "The guard must deny an unknown workspace." \
+  --prepare-only >/dev/null 2>&1; then
+  die "unknown workspace unexpectedly passed the guard"
+fi
+
+browser_tasks_cli --root "$workspace_root" task archive web-chat-smoke >/dev/null
+if "$HARNESS" \
+  --task-id web-chat-smoke \
+  --workspace-root "$workspace_root" \
+  --task "The guard must deny an archived workspace." \
+  --prepare-only >/dev/null 2>&1; then
+  die "archived workspace unexpectedly passed the guard"
+fi
+browser_tasks_cli --root "$workspace_root" task restore web-chat-smoke >/dev/null
+
+secret_dir="$smoke_root/secret"
+mkdir -p "$secret_dir"
+print -r -- 'api_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' > "$secret_dir/notes.md"
+if "$HARNESS" \
+  --task-id web-chat-smoke \
+  --workspace-root "$workspace_root" \
+  --task "A secret in a benign filename must be refused." \
+  --attachment "$secret_dir/notes.md" \
+  --prepare-only >/dev/null 2>&1; then
+  die "attachment carrying a secret was not refused"
+fi
+
 typeset -a common
 common=(
-  --task-id 20260724-120000-smoke
+  --task-id web-chat-smoke
+  --workspace-root "$workspace_root"
   --purpose research
   --reasoning best
   --research deep
   --task "Investigate a complex question with sources."
+  --keep
 )
 
 first="$("$HARNESS" "${common[@]}" --prepare-only)"
@@ -137,11 +201,23 @@ fi
 [[ ! -e "$surf_log" ]] \
   || die "Surf was invoked before disclosure hash validation"
 
+if PATH="$fake_bin:$PATH" WEB_CHAT_SMOKE_LOG="$surf_log" \
+  "$HARNESS" "${common[@]}" --approved-context-sha "$first_sha" \
+  >/dev/null 2>&1; then
+  die "live submission without --record-run-id unexpectedly succeeded"
+fi
+[[ ! -e "$surf_log" ]] \
+  || die "Surf was invoked before the recording precondition was checked"
+
+deep_run="$(smoke_run_start)"
+[[ -n "$deep_run" ]] || die "could not start a run for the deep delegation"
 live="$(
   PATH="$fake_bin:$PATH" WEB_CHAT_SMOKE_LOG="$surf_log" \
     WEB_CHAT_SMOKE_RESEARCH=deep \
-    "$HARNESS" "${common[@]}" --approved-context-sha "$first_sha"
+    "$HARNESS" "${common[@]}" --record-run-id "$deep_run" --record-lease-owner smoke \
+      --approved-context-sha "$first_sha"
 )"
+smoke_run_finish "$deep_run"
 [[ "$live" == *"Completed ChatGPT Web delegation"* ]] \
   || die "fake Surf delegation did not complete"
 response="$(response_path "$live")"
@@ -185,19 +261,24 @@ fi
 standard_log="$smoke_root/surf-standard.log"
 typeset -a standard_common
 standard_common=(
-  --task-id 20260724-120000-smoke
+  --task-id web-chat-smoke
+  --workspace-root "$workspace_root"
   --purpose research
   --reasoning best
   --research standard
   --task "Investigate a focused question with sources."
+  --keep
 )
 standard_prepared="$("$HARNESS" "${standard_common[@]}" --prepare-only)"
 standard_sha="$(context_sha "$standard_prepared")"
+standard_run="$(smoke_run_start)"
 standard_live="$(
   PATH="$fake_bin:$PATH" WEB_CHAT_SMOKE_LOG="$standard_log" \
     WEB_CHAT_SMOKE_RESEARCH=standard \
-    "$HARNESS" "${standard_common[@]}" --approved-context-sha "$standard_sha"
+    "$HARNESS" "${standard_common[@]}" --record-run-id "$standard_run" --record-lease-owner smoke \
+      --approved-context-sha "$standard_sha"
 )"
+smoke_run_finish "$standard_run"
 [[ "$standard_live" == *"Completed ChatGPT Web delegation"* ]] \
   || die "standard research delegation did not complete"
 standard_receipt="$(receipt_path "$standard_live")"
@@ -210,5 +291,34 @@ if grep -q 'locate.text Deep research --exact --action click' "$standard_log"; t
 fi
 grep -q 'STANDARD_RESEARCH_ACTIVE' "$standard_log" \
   || die "standard research mode was not verified before submission"
+grep -q '^surf_tab_id=42$' "$standard_receipt" \
+  || die "receipt does not record the Surf tab id"
+
+# The response and the receipt must be able to land inside the workspace
+# instead of living only in the system temp directory.
+record_run="$(smoke_run_start)"
+[[ -n "$record_run" ]] || die "could not start a run for delegation recording"
+recorded_log="$smoke_root/surf-recorded.log"
+recorded_sha="$(
+  context_sha "$("$HARNESS" "${standard_common[@]}" --prepare-only)"
+)"
+recorded="$(
+  PATH="$fake_bin:$PATH" WEB_CHAT_SMOKE_LOG="$recorded_log" \
+    WEB_CHAT_SMOKE_RESEARCH=standard \
+    "$HARNESS" "${standard_common[@]}" \
+      --record-run-id "$record_run" --record-lease-owner smoke \
+      --approved-context-sha "$recorded_sha"
+)"
+[[ "$recorded" == *"Completed ChatGPT Web delegation"* ]] \
+  || die "recorded delegation did not complete"
+browser_tasks_cli --root "$workspace_root" task show web-chat-smoke --json \
+  | grep -q '"category": "receipts"' \
+  || die "delegation receipt was not stored in the workspace"
+browser_tasks_cli --root "$workspace_root" task show web-chat-smoke --json \
+  | grep -q '"category": "delegations"' \
+  || die "delegation response was not stored in the workspace"
+browser_tasks_cli --root "$workspace_root" task audit web-chat-smoke \
+  | grep -q 'delegation.recorded' \
+  || die "delegation was not recorded in the audit log"
 
 print -r -- "web-chat smoke: PASS"

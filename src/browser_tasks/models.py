@@ -9,17 +9,26 @@ SCHEMA_VERSION = 1
 
 
 class TaskState(StrEnum):
-    NEW = "NEW"
-    SCOPED = "SCOPED"
-    PLANNED = "PLANNED"
-    READY = "READY"
-    AWAITING_AUTHORIZATION = "AWAITING_AUTHORIZATION"
-    EXECUTING = "EXECUTING"
-    VERIFYING = "VERIFYING"
+    DRAFT = "DRAFT"
+    OPEN = "OPEN"
     COMPLETED = "COMPLETED"
-    BLOCKED = "BLOCKED"
+    PAUSED = "PAUSED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class RunState(StrEnum):
+    SCOPING = "SCOPING"
+    PLANNING = "PLANNING"
+    READY = "READY"
+    EXECUTING = "EXECUTING"
+    VERIFYING = "VERIFYING"
+    WAITING = "WAITING"
+    SUCCEEDED = "SUCCEEDED"
+    INTERRUPTED = "INTERRUPTED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class ActionClass(StrEnum):
@@ -37,7 +46,7 @@ class Task:
     task_id: str
     goal: str
     created_at: str
-    state: TaskState = TaskState.NEW
+    state: TaskState = TaskState.DRAFT
     constraints: tuple[str, ...] = ()
     delegation_policy: str = "maximal"
     authorization_policy: str = "explicit"
@@ -57,6 +66,38 @@ class Task:
         data = asdict(self)
         data["state"] = self.state.value
         return data
+
+
+@dataclass(frozen=True)
+class TaskRun:
+    run_id: str
+    task_id: str
+    state: RunState
+    created_at: str
+    updated_at: str
+    lease_owner: str | None = None
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
+    resumes_run_id: str | None = None
+    checkpoint: str | None = None
+    failure: str | None = None
+    failure_class: str | None = None
+    recoverable: bool | None = None
+
+
+@dataclass(frozen=True)
+class Deliverable:
+    name: str
+    task_id: str
+    path: str
+    kind: str
+    sha256: str
+    revision: int
+    produced_by_run: str | None
+    reusable: bool
+    verified: bool
+    description: str
+    entrypoint: str | None = None
 
 
 @dataclass(frozen=True)

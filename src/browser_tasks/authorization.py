@@ -1,14 +1,50 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
+import json
+import re
 from datetime import UTC, datetime
 
 from .models import AuthorizationGrant, BrowserAction
 
 
+EVIDENCE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+
+
+def canonical_postconditions(action: BrowserAction) -> str:
+    return json.dumps(
+        [dict(sorted(item.items())) for item in action.postconditions],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def summary_sha256(action: BrowserAction) -> str:
-    return hashlib.sha256(action.summary.encode("utf-8")).hexdigest()
+    """Bind the human summary and the verification contract to one digest.
+
+    Postconditions are part of what an operator authorizes: a grant approved
+    for a strictly verified action must not be spendable on the same summary
+    with the checks removed.
+    """
+
+    material = "\n".join(
+        (
+            "summary",
+            action.summary,
+            "postconditions",
+            canonical_postconditions(action),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def validate_evidence_digest(evidence_sha256: str) -> str:
+    cleaned = evidence_sha256.strip().lower()
+    if not EVIDENCE_DIGEST.fullmatch(cleaned):
+        raise ValueError(
+            "evidence must be the sha256 digest of a captured artifact"
+        )
+    return cleaned
 
 
 def validate_grant(grant: AuthorizationGrant, action: BrowserAction, now: datetime | None = None) -> None:
@@ -28,8 +64,3 @@ def validate_grant(grant: AuthorizationGrant, action: BrowserAction, now: dateti
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise ValueError("invalid authorization grant: " + ", ".join(failed))
-
-
-def consume(grant: AuthorizationGrant, action: BrowserAction, now: datetime | None = None) -> AuthorizationGrant:
-    validate_grant(grant, action, now)
-    return replace(grant, uses=grant.uses + 1)

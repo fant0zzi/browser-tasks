@@ -32,6 +32,14 @@ Options:
   --research MODE   standard|deep (default: standard).
   --approved-context-sha H
                     Exact SHA printed by the delegate prepare-only phase.
+  --workspace-root DIR
+                    Root holding tasks/ (default: this repository).
+  --record-run-id RUN
+                    Store receipt and response under that run; required live.
+  --record-lease-owner OWNER
+                    Lease owner of the recording run when it is active.
+  --allow-finding PATH:KIND
+                    Approve one known-benign disclosure scan finding.
   --plain           Send a frozen patch (diff) or one regular file (selected).
   --prepare-only    Build, verify, and prepare exact disclosure without upload.
   -h, --help        Show this help.
@@ -52,20 +60,30 @@ require_command() {
 }
 
 is_excluded() {
-  local path part basename
-  path="$1"
-  basename="${path:t}"
+  # Case-insensitive: the default macOS volume is case-insensitive, so `TASKS/x`
+  # and `.ENV` reach the same bytes as their lowercase spelling.
+  # Never name a local `path`: zsh ties `path` to `PATH`, so assigning to it
+  # corrupts command lookup for the rest of the run.
+  local candidate part basename
+  candidate="${1:l}"
+  basename="${candidate:t}"
 
-  [[ "$path" == tasks/* ]] && return 0
+  [[ "$candidate" == tasks/* || "$candidate" == archive/* ]] && return 0
 
-  for part in ${(s:/:)path}; do
+  for part in ${(s:/:)candidate}; do
     [[ "$part" == ".git" ]] && return 0
   done
 
   [[ "$basename" == ".env.example" ]] && return 1
   [[ "$basename" == ".env" || "$basename" == .env.* ]] && return 0
   [[ "$basename" == ".config.yaml" || "$basename" == ".config.yml" ]] && return 0
+  [[ "$basename" == ".netrc" || "$basename" == ".npmrc" ]] && return 0
+  [[ "$basename" == ".pypirc" || "$basename" == ".git-credentials" ]] && return 0
+  [[ "$basename" == id_* ]] && return 0
   [[ "$basename" == *.pem || "$basename" == *.key ]] && return 0
+  [[ "$basename" == *.p12 || "$basename" == *.pfx ]] && return 0
+  [[ "$basename" == *.jks || "$basename" == *.keystore ]] && return 0
+  [[ "$basename" == *.p8 || "$basename" == *.ppk || "$basename" == *.kdbx ]] && return 0
   [[ "$basename" == ._* ]] && return 0
   return 1
 }
@@ -147,7 +165,10 @@ write_diff_context() {
     print -r -- "## Untracked files"
     for file in "${safe_untracked_paths[@]}"; do
       git --literal-pathspecs -C "$repo_root" diff --no-ext-diff --binary --no-index -- /dev/null "$file" || {
-        [[ "$?" -eq 1 ]] || return
+        # git diff --no-index reports 1 for "differences found"; anything else
+        # is a real failure that must not exit with an empty message.
+        [[ "$?" -eq 1 ]] \
+          || fail "git diff --no-index failed for untracked path: $file"
       }
     done
   } > "$patch_file"
@@ -205,7 +226,7 @@ verify_repository_payload() {
     is_excluded "$file" && fail "archive verification found excluded manifest path: $file"
     [[ -z "${expected[$file]-}" ]] \
       || fail "archive verification found duplicate manifest path: $file"
-    [[ -L "$payload_root/$file" || -f "$payload_root/$file" ]] \
+    [[ -f "$payload_root/$file" && ! -L "$payload_root/$file" ]] \
       || fail "archive verification found missing or unsupported manifest entry: $file"
     expected[$file]=1
     (( expected_count += 1 ))
@@ -216,7 +237,7 @@ verify_repository_payload() {
     if [[ -d "$entry" && ! -L "$entry" ]]; then
       continue
     fi
-    [[ -f "$entry" || -L "$entry" ]] \
+    [[ -f "$entry" && ! -L "$entry" ]] \
       || fail "archive verification found unsupported payload entry: $entry"
     relative="${entry#"$payload_root"/}"
     is_excluded "$relative" && fail "archive verification found excluded payload path: $relative"
@@ -235,6 +256,44 @@ verify_repository_payload() {
       || fail "archive verification payload is missing manifest path: $file"
   done
   print -r -- "$actual_count"
+}
+
+readonly REPO_TOOLS_ROOT="${SCRIPT_DIR:h:h}"
+
+browser_tasks_cli() {
+  PYTHONPATH="$REPO_TOOLS_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m browser_tasks.cli "$@"
+}
+
+typeset -gA allowed_findings
+typeset -ga approved_findings
+approved_findings=()
+
+scan_context() {
+  local root="$1"
+  shift
+  local output line kind finding_path
+  integer unapproved=0 scan_status=0
+  output="$(browser_tasks_cli scan --repo-root "$root" "$@" 2>&1)" \
+    && scan_status=0 || scan_status=$?
+  (( scan_status == 0 )) && return 0
+  # Only exit code 5 means "findings". Treating every non-zero status as
+  # findings made any scan failure with tab-free output read as clean.
+  (( scan_status == 5 )) \
+    || fail "disclosure scan could not run:"$'\n'"$output"
+  for line in ${(f)output}; do
+    [[ "$line" == *$'\t'* ]] || continue
+    kind="${line%%$'\t'*}"
+    finding_path="${line#*$'\t'}"
+    if [[ -n "${allowed_findings[$finding_path:$kind]-}" ]]; then
+      approved_findings+=("$finding_path:$kind")
+      continue
+    fi
+    print -u2 -r -- "$PROGRAM: unapproved disclosure finding: $kind $finding_path"
+    (( unapproved += 1 ))
+  done
+  (( unapproved == 0 )) \
+    || fail "disclosure scan rejected the context; approve a known-benign match with --allow-finding PATH:KIND"
 }
 
 validate_private_output_dir() {
@@ -259,241 +318,6 @@ enforce_source_fingerprint() {
   [[ "$before" == "$after" ]] && return 0
   discard_private_output_dir "$private_output_dir"
   fail "repository changed while context was being prepared; discarded the output"
-}
-
-submit_via_ui() {
-  local prompt="$1" context_file="$2" chat_url="$3"
-  local tab_output tab_id proxy_output read_output proxy_ref send_ref
-  local baseline_output attachment_output submission_output
-  local proxy_js baseline_js attachment_js submission_js
-  local -a targeted_surf
-  integer attempt proxy_ready=0 baseline_ready=0 attachment_ready=0
-  integer prompt_sent=0 send_clicked=0
-
-  tab_output="$(surf tab.new "$chat_url")"
-  [[ "$tab_output" == "Created tab "*:* ]] \
-    || fail "UI transport could not parse the new tab id: $tab_output"
-  tab_id="${tab_output#Created tab }"
-  tab_id="${tab_id%%:*}"
-  [[ "$tab_id" == <-> ]] || fail "UI transport received an invalid tab id: $tab_id"
-  targeted_surf=(surf --tab-id "$tab_id")
-
-  proxy_js='
-    const target = document.querySelector("#upload-files");
-    if (!target) return "TARGET_NOT_FOUND";
-    let proxy = document.querySelector("#web-review-upload-proxy");
-    if (!proxy) {
-      proxy = document.createElement("input");
-      proxy.id = "web-review-upload-proxy";
-      proxy.type = "file";
-      proxy.setAttribute("aria-label", "Web review upload proxy");
-      proxy.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:2147483647;width:280px;height:36px;opacity:1;";
-      proxy.addEventListener("change", () => {
-        const currentTarget = document.querySelector("#upload-files");
-        if (!currentTarget) return;
-        const expectedName = proxy.files && proxy.files[0]
-          ? proxy.files[0].name
-          : "";
-        document.documentElement.dataset.webReviewExpectedAttachmentName =
-          expectedName;
-        currentTarget.files = proxy.files;
-        currentTarget.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      document.body.appendChild(proxy);
-    }
-    return "READY";
-  '
-  baseline_js='
-    const baseline = document.querySelectorAll(
-      "[data-message-author-role=\"user\"]"
-    ).length;
-    document.documentElement.dataset.webReviewUserMessageBaseline =
-      String(baseline);
-    return "BASELINE_READY";
-  '
-  attachment_js='
-    const expected =
-      document.documentElement.dataset.webReviewExpectedAttachmentName || "";
-    if (!expected) return "ATTACHMENT_WAITING";
-    const visible = (node) => {
-      const style = window.getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      return style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        rect.width > 0 &&
-        rect.height > 0;
-    };
-    const errorNodes = Array.from(document.querySelectorAll(
-      "[role=\"alert\"], [aria-live=\"assertive\"], [data-testid*=\"error\"]"
-    )).filter(visible);
-    const errorText = errorNodes
-      .map((node) => node.innerText || node.textContent || "")
-      .join(" ")
-      .toLowerCase();
-    if (
-      /(upload|file|attachment)/.test(errorText) &&
-      /(fail|error|reject|unsupported|too large|could not|couldn.t)/.test(errorText)
-    ) {
-      return "ATTACHMENT_ERROR";
-    }
-    const nameNode = Array.from(document.querySelectorAll("body *"))
-      .filter(visible)
-      .find((node) => {
-        const text = (node.innerText || node.textContent || "").trim();
-        const aria = (node.getAttribute("aria-label") || "").trim();
-        const title = (node.getAttribute("title") || "").trim();
-        return text === expected || aria === expected || title === expected;
-      });
-    if (!nameNode) return "ATTACHMENT_WAITING";
-    const container = nameNode.closest(
-      "[data-testid*=\"attachment\"], [class*=\"attachment\"], li, article, div"
-    ) || nameNode.parentElement;
-    if (
-      container &&
-      (
-        container.matches("[aria-busy=\"true\"]") ||
-        container.querySelector("[aria-busy=\"true\"], [role=\"progressbar\"]")
-      )
-    ) {
-      return "ATTACHMENT_WAITING";
-    }
-    return "ATTACHMENT_READY";
-  '
-  submission_js='
-    const originReady = window.location.origin === "https://chatgpt.com";
-    const pathReady = window.location.pathname.includes("/c/");
-    const composer =
-      document.querySelector("#prompt-textarea") ||
-      document.querySelector("[role=\"textbox\"]");
-    if (!composer) return "WAITING";
-    const composerValue =
-      typeof composer.value === "string"
-        ? composer.value
-        : (composer.innerText || composer.textContent || "");
-    const baseline = Number.parseInt(
-      document.documentElement.dataset.webReviewUserMessageBaseline || "",
-      10
-    );
-    const currentUserMessages = document.querySelectorAll(
-      "[data-message-author-role=\"user\"]"
-    ).length;
-    const expected =
-      document.documentElement.dataset.webReviewExpectedAttachmentName || "";
-    const userMessages = Array.from(document.querySelectorAll(
-      "[data-message-author-role=\"user\"]"
-    ));
-    const newUserMessages = Number.isFinite(baseline)
-      ? userMessages.slice(baseline)
-      : [];
-    const attachmentOwned = expected && newUserMessages.some((message) => {
-      return Array.from(message.querySelectorAll("*")).some((node) => {
-        const text = (node.innerText || node.textContent || "").trim();
-        const aria = (node.getAttribute("aria-label") || "").trim();
-        const title = (node.getAttribute("title") || "").trim();
-        return text === expected || aria === expected || title === expected;
-      });
-    });
-    const messageAdded =
-      Number.isFinite(baseline) &&
-      currentUserMessages > baseline &&
-      newUserMessages.length > 0;
-    if (
-      originReady &&
-      pathReady &&
-      composerValue.trim().length === 0 &&
-      messageAdded &&
-      attachmentOwned
-    ) {
-      return "SUBMITTED";
-    }
-    return "WAITING";
-  '
-
-  for attempt in {1..30}; do
-    proxy_output="$("${targeted_surf[@]}" js "$proxy_js" 2>/dev/null || true)"
-    if [[ "$proxy_output" == *"READY"* ]]; then
-      proxy_ready=1
-      break
-    fi
-    "${targeted_surf[@]}" wait 1 >/dev/null
-  done
-  (( proxy_ready )) || fail "UI transport could not find ChatGPT's upload input in tab $tab_id"
-
-  for attempt in {1..10}; do
-    read_output="$("${targeted_surf[@]}" page.read --all 2>/dev/null || true)"
-    proxy_ref="$(
-      print -r -- "$read_output" \
-        | awk '/^[[:space:]]*button "Web review upload proxy" \[e[0-9]+\]/ {
-            if (match($0, /\[e[0-9]+\]/)) {
-              print substr($0, RSTART + 1, RLENGTH - 2)
-              exit
-            }
-          }'
-    )"
-    if [[ -n "$proxy_ref" ]]; then
-      break
-    fi
-    "${targeted_surf[@]}" wait 1 >/dev/null
-  done
-  [[ -n "${proxy_ref:-}" ]] || fail "UI transport could not resolve the upload proxy ref in tab $tab_id"
-
-  baseline_output="$("${targeted_surf[@]}" js "$baseline_js" 2>/dev/null || true)"
-  [[ "$baseline_output" == *"BASELINE_READY"* ]] && baseline_ready=1
-  (( baseline_ready )) || fail "UI transport could not record the user-message baseline in tab $tab_id"
-
-  "${targeted_surf[@]}" upload --ref "$proxy_ref" --files "$context_file"
-  for attempt in {1..120}; do
-    attachment_output="$("${targeted_surf[@]}" js "$attachment_js" 2>/dev/null || true)"
-    [[ "$attachment_output" == *"ATTACHMENT_ERROR"* ]] \
-      && fail "UI transport observed a ChatGPT attachment upload error in tab $tab_id"
-    if [[ "$attachment_output" == *"ATTACHMENT_READY"* ]]; then
-      attachment_ready=1
-      break
-    fi
-    "${targeted_surf[@]}" wait 1 >/dev/null
-  done
-  (( attachment_ready )) \
-    || fail "UI transport did not observe a completed visible attachment in tab $tab_id"
-
-  "${targeted_surf[@]}" locate.role textbox --name "Chat with ChatGPT" --action fill --value "$prompt"
-
-  for attempt in {1..120}; do
-    if (( send_clicked )); then
-      submission_output="$("${targeted_surf[@]}" js "$submission_js" 2>/dev/null || true)"
-      if [[ "$submission_output" == *"SUBMITTED"* ]]; then
-        prompt_sent=1
-        break
-      fi
-    else
-      read_output="$("${targeted_surf[@]}" page.read --all 2>/dev/null || true)"
-      send_ref="$(
-        print -r -- "$read_output" \
-          | awk '/^[[:space:]]*button "Send prompt" \[e[0-9]+\]/ && $0 !~ /\[disabled\]/ {
-              if (match($0, /\[e[0-9]+\]/)) {
-                print substr($0, RSTART + 1, RLENGTH - 2)
-                exit
-              }
-            }'
-      )"
-      if [[ -n "$send_ref" ]]; then
-        "${targeted_surf[@]}" click "$send_ref" >/dev/null 2>&1 \
-          || fail "UI transport could not click enabled Send prompt in tab $tab_id"
-        send_clicked=1
-      fi
-    fi
-    "${targeted_surf[@]}" wait 1 >/dev/null
-  done
-  (( prompt_sent )) \
-    || fail "UI transport did not observe a new user message owning the expected attachment, /c/ URL, and empty composer after ${send_clicked} Send prompt click in tab $tab_id; retry manually"
-
-  print -r -- "Submitted in ChatGPT tab: $tab_id"
-  print -r -- "Chat URL: $chat_url"
-  print -r -- "Monitor the response in that browser tab; the harness will not capture or import it."
-}
-
-submit_to_web_chat() {
-  local prompt="$1" context_file="$2"
-  submit_via_ui "$prompt" "$context_file" "$chat_url"
 }
 
 render_prompt() {
@@ -578,6 +402,9 @@ research_mode=standard
 approved_context_sha=""
 prepare_only=0
 plain=0
+workspace_root="${WEB_REVIEW_WORKSPACE_ROOT:-$REPO_TOOLS_ROOT}"
+record_run_id=""
+record_lease_owner=""
 typeset -a selected_paths
 selected_paths=()
 
@@ -629,6 +456,27 @@ while [[ $# -gt 0 ]]; do
       approved_context_sha="$2"
       shift 2
       ;;
+    --workspace-root)
+      [[ $# -ge 2 ]] || fail "--workspace-root requires a value"
+      workspace_root="$2"
+      shift 2
+      ;;
+    --record-run-id)
+      [[ $# -ge 2 ]] || fail "--record-run-id requires a value"
+      record_run_id="$2"
+      shift 2
+      ;;
+    --record-lease-owner)
+      [[ $# -ge 2 ]] || fail "--record-lease-owner requires a value"
+      record_lease_owner="$2"
+      shift 2
+      ;;
+    --allow-finding)
+      [[ $# -ge 2 ]] || fail "--allow-finding requires PATH:KIND"
+      [[ "$2" == *:* ]] || fail "--allow-finding expects PATH:KIND"
+      allowed_findings[$2]=1
+      shift 2
+      ;;
     --prepare-only)
       prepare_only=1
       shift
@@ -658,11 +506,15 @@ done
 
 [[ -z "$task_text" || -z "$task_file" ]] || fail "use either --task or --task-file, not both"
 if [[ -n "$task_file" ]]; then
-  [[ -f "$task_file" ]] || fail "task file not found: $task_file"
+  # Mirrors the delegate: a symlinked task file must not pull unintended
+  # content into the frozen prompt.
+  [[ -f "$task_file" && ! -L "$task_file" ]] \
+    || fail "task file must be a regular non-symlink file: $task_file"
   task_text="$(<"$task_file")"
 fi
 [[ -n "${task_text//[[:space:]]/}" ]] || fail "a non-empty --task or --task-file is required"
-[[ "$task_id" =~ '^[0-9]{8}-[0-9]{6}-[a-z0-9][a-z0-9-]*$' ]] \
+[[ "$task_id" =~ '^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$' ]] \
+  && [[ ! "$task_id" =~ '^[0-9]{8}-[0-9]{6}($|-)' ]] \
   || fail "invalid or missing --task-id"
 [[ "$reasoning" == best || "$reasoning" == high || "$reasoning" == max ]] \
   || fail "--reasoning must be best, high, or max"
@@ -682,9 +534,16 @@ else
   [[ ${#selected_paths[@]} -eq 0 ]] || fail "$mode mode does not accept selected paths"
 fi
 
-for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc tr date; do
+for command_name in git tar zstd shasum awk cat cp chmod mkdir mktemp rm wc tr date \
+  find touch sort head python3; do
   require_command "$command_name"
 done
+
+# A denied guard is terminal for this route, so ask before any packaging work.
+guard_output="$(
+  browser_tasks_cli --root "$workspace_root" guard "$task_id" \
+    --capability reasoning --tool web-review 2>&1
+)" || fail "task guard denied web-review for $task_id:"$'\n'"$guard_output"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not inside a Git repository"
 repo_root="${repo_root:A}"
@@ -757,9 +616,11 @@ mkdir -p -- "$repository_dir" "$manifest_dir" "$context_dir" "$request_dir"
 all_candidates="$work_dir/all-candidates.nul"
 selected_files="$manifest_dir/files.nul"
 excluded_files="$manifest_dir/excluded.nul"
+missing_files="$manifest_dir/missing.nul"
 : > "$all_candidates"
 : > "$selected_files"
 : > "$excluded_files"
+: > "$missing_files"
 
 {
   git -C "$repo_root" ls-files -z
@@ -814,6 +675,13 @@ if [[ "$mode" == "diff" ]]; then
       (( excluded_count += 1 ))
       continue
     fi
+    if [[ -L "$repo_root/$file" ]]; then
+      # The payload packer excludes symlinks; the patch must not disclose the
+      # target the receipt says was excluded.
+      print -rn -- "$file"$'\0' >> "$excluded_files"
+      (( excluded_count += 1 ))
+      continue
+    fi
     safe_changed_map[$file]=1
     safe_changed_paths+=("$file")
     (( safe_changed_count += 1 ))
@@ -846,10 +714,20 @@ while IFS= read -r -d '' file; do
     (( skipped_submodule_count += 1 ))
     continue
   fi
-  if [[ ! -f "$repo_root/$file" && ! -L "$repo_root/$file" ]]; then
+  if [[ -L "$repo_root/$file" ]]; then
+    # A symlink in the payload discloses its target path and is a hazard for
+    # whoever unpacks the archive; the README promised they were rejected.
+    print -rn -- "$file"$'\0' >> "$excluded_files"
+    (( excluded_count += 1 ))
+    continue
+  fi
+  if [[ ! -f "$repo_root/$file" ]]; then
     if [[ "$mode" == "diff" && -n "${deleted_paths[$file]-}" ]]; then
       continue
     fi
+    # Name every omission: an anonymous count cannot tell a reviewer whether a
+    # module was removed or silently dropped by the packer.
+    print -rn -- "$file"$'\0' >> "$missing_files"
     (( missing_count += 1 ))
     continue
   fi
@@ -869,6 +747,16 @@ if (( included_count > 0 )); then
   ) | tar -xf - -C "$repository_dir"
 fi
 
+# Content scanning is a hard disclosure requirement (AGENTS.md), and a filename
+# denylist cannot see a token inside `config.py`. Fail closed before the bytes
+# are ever packaged; a known-benign match must be approved by name.
+if (( included_count > 0 )); then
+  scan_context "$repository_dir" --from-nul "$selected_files"
+fi
+if [[ "$mode" == "diff" && -f "$context_dir/review.patch" ]]; then
+  scan_context "$context_dir" -- review.patch
+fi
+
 {
   while IFS= read -r -d '' file; do
     printf '%q\n' "$file"
@@ -880,6 +768,14 @@ fi
     printf '%q\n' "$file"
   done < "$excluded_files"
 } > "$manifest_dir/excluded.txt"
+
+{
+  while IFS= read -r -d '' file; do
+    printf '%q\t%s\n' "$file" \
+      "$(git --literal-pathspecs -C "$repo_root" status --porcelain=v1 \
+        -- "$file" | head -1)"
+  done < "$missing_files"
+} > "$manifest_dir/missing.txt"
 
 if [[ "$mode" == "selected" ]]; then
   {
@@ -899,6 +795,9 @@ fi
 
 cp "$SCRIPT_DIR/prompt.md" "$request_dir/review-contract.md"
 print -r -- "$task_text" > "$request_dir/task.md"
+# The review task is operator text that ships inside the archive, so it is
+# scanned like any other disclosed file.
+scan_context "$request_dir" -- task.md
 
 {
   print -r -- "format_version=1"
@@ -915,12 +814,18 @@ print -r -- "$task_text" > "$request_dir/task.md"
   print -r -- "deleted_count=$deleted_count"
   print -r -- "skipped_submodule_count=$skipped_submodule_count"
   print -r -- "missing_count=$missing_count"
+  print -r -- "approved_finding_count=${#approved_findings[@]}"
+  integer approved_index=0
+  for approved in "${approved_findings[@]}"; do
+    (( approved_index += 1 ))
+    printf 'approved_finding_%d=%s\n' "$approved_index" "$approved"
+  done
 } > "$manifest_dir/snapshot.txt"
 
 integer verified_manifest_count=0
 while IFS= read -r -d '' file; do
   is_excluded "$file" && fail "excluded path survived manifest filtering: $file"
-  [[ -f "$repository_dir/$file" || -L "$repository_dir/$file" ]] \
+  [[ -f "$repository_dir/$file" && ! -L "$repository_dir/$file" ]] \
     || fail "manifest file missing from bundle: $file"
   (( verified_manifest_count += 1 ))
 done < "$selected_files"
@@ -950,7 +855,34 @@ if (( plain )); then
   fi
 else
   artifact="$output_dir/${repo_name}-${mode}-${timestamp}-$$.tar.zst"
-  tar -cf - -C "$bundle_root" . | zstd -q -10 -T0 -o "$artifact"
+  # Reproducible packaging: the two-phase approval compares a hash of these
+  # bytes, so member order and mtimes must not vary between preparations.
+  # Without this, prepare printed one hash and the live rerun computed another,
+  # and the approval gate could never converge.
+  # TZ=UTC because `touch -t` reads the stamp in local time: without it the
+  # normalised mtime — and therefore the approved hash — shifts with the
+  # environment, which is the same non-convergence in a different disguise.
+  TZ=UTC find "$bundle_root" -depth -exec touch -h -t 198001010000 -- {} + \
+    || fail "could not normalise bundle timestamps for reproducible packaging"
+  bundle_entries="$work_dir/bundle-entries.nul"
+  (
+    cd "$bundle_root"
+    find . -mindepth 1 -print0
+  ) | LC_ALL=C sort -z > "$bundle_entries"
+  # ustar rather than pax: libarchive's pax writer emits per-run extended
+  # headers, which makes the bytes differ between otherwise identical
+  # preparations and breaks the approval gate. ustar caps a stored path at 100
+  # characters (or 155 + 100 when it can split on a slash), so refuse a bundle
+  # it cannot represent instead of writing a broken archive.
+  while IFS= read -r -d '' bundle_entry; do
+    [[ ${#bundle_entry} -le 100 ]] && continue
+    fail "path is too long for reproducible packaging: ${bundle_entry#./}"
+  done < "$bundle_entries"
+  (
+    cd "$bundle_root"
+    LC_ALL=C tar -cf - --format=ustar --null --no-recursion \
+      --uid 0 --gid 0 --numeric-owner -T "$bundle_entries"
+  ) | zstd -q -10 --single-thread -o "$artifact"
 
   verify_dir="$work_dir/verify"
   mkdir -p -- "$verify_dir"
@@ -983,7 +915,9 @@ enforce_source_fingerprint \
   print -r -- "artifact_bytes=$artifact_bytes"
   print -r -- "context_format=$context_format"
   print -r -- "transport=$transport"
-  [[ "$transport" == "ui" ]] && printf 'chat_url=%q\n' "$chat_url"
+  # Always recorded: the destination is part of the disclosure inventory, and
+  # --chat-url can point at a specific conversation or project.
+  printf 'chat_url=%s\n' "$chat_url"
   print -r -- "repository=$repo_name"
   print -r -- "branch=$branch"
   print -r -- "head=$head_sha"
@@ -1009,8 +943,36 @@ enforce_source_fingerprint \
   print -r -- "deleted_count=$deleted_count"
   print -r -- "skipped_submodule_count=$skipped_submodule_count"
   print -r -- "missing_count=$missing_count"
+  integer missing_index=0
+  while IFS= read -r -d '' file; do
+    (( missing_index += 1 ))
+    printf 'missing_%d=%q\n' "$missing_index" "$file"
+  done < "$missing_files"
+  print -r -- "approved_finding_count=${#approved_findings[@]}"
+  integer receipt_finding_index=0
+  for approved in "${approved_findings[@]}"; do
+    (( receipt_finding_index += 1 ))
+    printf 'approved_finding_%d=%s\n' "$receipt_finding_index" "$approved"
+  done
   print -r -- "verified_artifact_count=$verified_artifact_count"
 } > "$receipt"
+
+# Attestation the delegate verifies against the artifact digest, so accepting a
+# packed archive is not a matter of trusting a command-line flag.
+scan_attestation="${artifact}.scan-receipt.txt"
+{
+  print -r -- "format_version=1"
+  print -r -- "artifact_sha256=$artifact_hash"
+  print -r -- "scan=clean"
+  print -r -- "scanner=browser_tasks.cli scan"
+  print -r -- "approved_finding_count=${#approved_findings[@]}"
+  integer attested_index=0
+  for approved in "${approved_findings[@]}"; do
+    (( attested_index += 1 ))
+    printf 'approved_finding_%d=%s\n' "$attested_index" "$approved"
+  done
+} > "$scan_attestation"
+chmod 600 "$scan_attestation"
 keep_output=1
 
 print -r -- "Prepared: $artifact"
@@ -1033,17 +995,21 @@ prompt="$(render_prompt "$task_text" "$artifact_hash" "$artifact_bytes")"
 typeset -a delegate_args
 delegate_args=(
   --task-id "$task_id"
+  --workspace-root "$workspace_root"
   --purpose review
   --reasoning "$reasoning"
   --research "$research_mode"
   --chat-url "$chat_url"
   --task "$prompt"
   --attachment "$artifact"
+  # Every packed file was content-scanned above; the delegate verifies this
+  # attestation against the artifact digest instead of trusting a flag.
+  --scan-receipt "$scan_attestation"
 )
+[[ -z "$record_run_id" ]] || delegate_args+=(--record-run-id "$record_run_id")
+[[ -z "$record_lease_owner" ]] \
+  || delegate_args+=(--record-lease-owner "$record_lease_owner")
 if (( prepare_only )); then
-  if [[ "${WEB_REVIEW_TEST_MODE:-}" == 1 ]]; then
-    exit 0
-  fi
   "$WEB_CHAT_DELEGATE" "${delegate_args[@]}" --prepare-only
   exit 0
 fi
