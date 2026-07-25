@@ -1,455 +1,210 @@
 # Browser Tasks
 
-Browser Tasks is a human-first workspace harness for reusable browser
-automation, UI testing, and web research through the user's authenticated
-browser.
+Cheap, durable automation of long-running work that has to happen **in a real
+browser**, with a real logged-in session.
 
-The filesystem represents durable user intent, not execution attempts:
+Two ideas carry the whole project:
 
-```text
-one user intent → one stable task workspace → many hidden runs
-```
+1. **Your local agent drives the browser. A web chat does the thinking.**
+   Planning, architecture, review and research are delegated to a chat you
+   already pay a flat subscription for — through its normal browser interface,
+   not a metered API. The local agent spends its own budget only on short,
+   deterministic work and on the browser actions themselves.
+2. **A task is a place, not an attempt.** One user intent gets one folder that
+   survives crashes, restarts and weeks of calendar time. Retries, reruns and
+   research are hidden inside it.
 
-Simple questions, clarifications, status requests, and lookups stay in chat and
-do not create task folders.
+## What it is good for
 
-## Workspace model
+**Recurring authenticated checks.** Build a visa-slot tracker, a price watch or
+a portal status check once, publish it as a reusable script, then rerun it for
+almost nothing. The tenth run costs a browser session and a few local calls — no
+re-planning, no re-reasoning.
 
-```text
-tasks/
-└── visa-slot-tracker/
-    ├── README.md
-    ├── deliverables/                 # created on first publication
-    │   ├── tracker/
-    │   │   ├── README.md
-    │   │   ├── run.sh
-    │   │   ├── src/
-    │   │   ├── tests/
-    │   │   └── config.example.toml
-    │   └── latest-check.md
-    └── .task/
-        ├── state.sqlite
-        └── runs/                     # created only when artifacts exist
-            └── <internal-run-id>/
-                ├── evidence/
-                ├── receipts/
-                ├── delegations/
-                └── scratch/
-```
+**Multi-step flows behind a login.** Filling a long application, submitting a
+form, booking a slot: flows that break plain scraping because they need a real
+session, several dependent steps and a look at the result afterwards.
 
-A new workspace contains exactly:
+**Delegated code review.** Freeze a repository snapshot, get its exact digest,
+approve that digest, and send it to the web chat in one shot. You get a
+full-repository review for the price of a chat message instead of a large API
+bill. This repository's own review history was produced that way.
 
-```text
-README.md
-.task/state.sqlite
-```
+**Research that spans days.** Each research pass is a hidden run inside one
+workspace, so the answers accumulate in one place instead of scattering across
+folders named after timestamps.
 
-There are no placeholder results or eager empty directories. Optional paths
-appear only when content exists.
+**What it is not:** not a scraper, not a hosted service, not an API client. It
+never asks for an API key, and it never opens its own headless browser — it uses
+the browser you are already logged into.
 
-- `README.md` is the human landing page: purpose, current status, latest
-  outcome, available deliverables, and reuse instructions.
-- `deliverables/` contains only published user-relevant reports, scripts,
-  configuration, datasets, or bundles.
-- `.task/` contains agent-owned state, runs, authorization records, evidence,
-  receipts, and scratch material.
+## Where the money goes
 
-## Stable names
+| Work | Who does it | What it costs |
+| --- | --- | --- |
+| Planning, architecture, review, research | Web chat, in your browser | Your existing subscription |
+| Deciding what to click, clicking it, verifying the result | Local agent | Local agent's own budget |
+| Rerunning something already built | Published script | Almost nothing |
 
-Workspace names are short semantic slugs:
+The saving is real but specific: it works because the expensive thinking goes
+through an interactive chat window on a flat plan. In exchange you accept that a
+human is nearby and that the browser session is a shared resource.
 
-```text
-visa-slot-tracker
-microbusiness-ideas
-quarterly-expense-report
-```
+## Providers
 
-Timestamps and opaque identifiers stay in metadata. A timestamp-shaped task
-name is rejected.
+ChatGPT Web is the default and, today, the only wired delegate. The transport
+pins the provider, the destination origin and the browser path, and fails closed
+instead of quietly falling back to an API, a different browser, or a different
+search tool — a delegation that cannot run the way it was approved does not run
+at all.
 
-Before creating a workspace, search for an existing continuation:
+Any subscription chat that lives in a browser fits the same shape (a tab, a
+composer, a reasoning selector, an attachment), but adding one means changing
+those pinned checks in `tools/web-chat/web-chat.zsh` and
+`src/browser_tasks/policy.py`. It is not a configuration switch yet.
+
+## Requirements
+
+- macOS or Linux with `zsh`
+- Python 3.11+, plus `git`, `tar`, `zstd`, `shasum`, `find`, `touch`, `sort`,
+  `head`, `grep` and the usual POSIX utilities
+- The `surf` command-line tool, connected to your own browser
+- A logged-in ChatGPT Web session in that browser
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task find "visa slot"
+python3 -m pip install -e '.[dev]'
 ```
-
-Resume, refine, rerun, or maintain the same outcome in the same workspace. A
-new top-level workspace is warranted only when the durable objective, owner,
-authorization boundary, target account, jurisdiction, confidentiality policy,
-or independent delivery lifecycle materially changes.
 
 ## Quick start
 
-Create durable work only after the objective is clear:
+Create a workspace only when the work is durable. A question you just want
+answered is a conversation, not a task.
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task init \
-  visa-slot-tracker \
+browser-tasks task init visa-slot-tracker \
   --title "Visa slot tracker" \
   --goal "Build and operate a reusable visa appointment slot tracker"
 ```
 
-Discover it without knowing an internal ID:
+Work happens inside a run, which holds a time-limited lease so a dead process
+can never leave the workspace looking busy forever:
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task list
-PYTHONPATH=src python3 -m browser_tasks.cli task find "finished visa tracker"
-PYTHONPATH=src python3 -m browser_tasks.cli task show visa-slot-tracker
-PYTHONPATH=src python3 -m browser_tasks.cli task audit \
-  visa-slot-tracker --jsonl
+browser-tasks task run-start visa-slot-tracker --lease-owner session-42
+# ... browser work ...
+browser-tasks task run-finish visa-slot-tracker <run-id> \
+  --state SUCCEEDED --lease-owner session-42
 ```
 
-Start and finish a hidden run:
+Publish what is worth keeping, and say explicitly that you verified it:
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task run-start \
-  visa-slot-tracker --state EXECUTING --lease-owner agent-session-42
-
-PYTHONPATH=src python3 -m browser_tasks.cli task run-finish \
-  visa-slot-tracker <run-id> --state SUCCEEDED \
-  --lease-owner agent-session-42
-```
-
-Store evidence or receipts only when they actually exist:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task artifact-store \
-  visa-slot-tracker <run-id> ./before.txt \
-  --category evidence --name before.txt
-```
-
-Publish a reusable deliverable:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task publish \
-  visa-slot-tracker ./tracker \
-  --name tracker \
-  --kind browser-automation \
+browser-tasks task publish visa-slot-tracker ./tracker \
+  --name tracker --kind browser-automation \
   --description "Reusable visa appointment slot tracker" \
-  --entrypoint run.sh \
-  --reusable \
-  --verified
-```
+  --entrypoint run.sh --reusable --verified
 
-`--verified` is explicit: publication does not assert verification on the
-operator's behalf, and completion refuses an unverified deliverable.
-
-Finish only after all completion invariants pass:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task complete \
-  visa-slot-tracker \
+browser-tasks task complete visa-slot-tracker \
   --summary "The tracker is verified and ready for reuse."
 ```
 
-## Runs and crash recovery
-
-Task outcome and run activity are separate. A failed check today does not
-invalidate a previously verified tracker.
-
-Task state describes the durable workspace: `DRAFT`, `OPEN`, `COMPLETED`,
-`PAUSED`, `FAILED`, `CANCELLED`, or `SUPERSEDED`. Execution details live only
-in run states such as `EXECUTING`, `WAITING`, `SUCCEEDED`, and `INTERRUPTED`.
-
-An active run owns a lease and heartbeat. The default lease is one hour, which
-outlives the delegation transport's own timeout, and no lease may exceed six
-hours so a dead worker cannot hold a workspace forever. A returning owner may
-renew or finish its own run even if the lease already lapsed, as long as nobody
-recovered it in the meantime.
-
-If its worker disappears, the harness converts the expired run to `INTERRUPTED`,
-prunes that run's scratch, and pauses the workspace:
+Reuse it later without knowing any internal identifier:
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task recover visa-slot-tracker
+browser-tasks task find "visa slot"
+browser-tasks task deliverables visa-slot-tracker
+browser-tasks task resume visa-slot-tracker --lease-owner session-43
 ```
 
-`doctor` also reports an active run whose lease has already expired, so a stale
-"running" status is visible rather than silent. When a worker will never return,
-take the run over explicitly:
+A workspace stays readable by a human:
 
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task run-abandon \
-  visa-slot-tracker <run-id> --reason "worker host was reimaged"
+```text
+tasks/visa-slot-tracker/
+├── README.md            # purpose, status, what is ready, how to run it
+├── deliverables/        # the reusable script, reports, datasets
+└── .task/               # state, evidence, receipts (agent-owned)
 ```
 
-A run may also advance between active states instead of being restarted:
+## Delegating the thinking
+
+Every delegation is two steps: freeze, then submit exactly what was approved.
 
 ```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task run-state \
-  visa-slot-tracker <run-id> --state VERIFYING --lease-owner agent-session-42
-```
-
-Resuming creates a new hidden run linked to the terminal run it continues. It
-never creates another top-level folder.
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task resume \
-  visa-slot-tracker --lease-owner agent-session-43
-```
-
-The harness keeps one writer per workspace. SQLite transactions protect state
-changes; visible files are staged and atomically renamed. User-edited
-deliverables are detected by digest and never silently overwritten.
-
-Publication and artifact storage record their intent in a journal before they
-touch a visible file, so a crash in that window is an interrupted operation
-rather than damage that looks like a user edit. Resolve one with:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task repair visa-slot-tracker
-```
-
-`repair` finishes or rolls back an interrupted publish, adopts or discards an
-interrupted or orphaned artifact, clears abandoned publish staging, prunes scratch
-left on terminal runs, and regenerates a `README.md` that lags the recorded state.
-
-It reports what it did (`REPAIRED`) separately from what it could not decide
-(`UNRESOLVED`), and exits `2` while anything remains unresolved, so automation
-cannot read a diagnostic as a repair. The one state it cannot decide alone is a
-crashed publish whose visible content matches neither the staged nor the previous
-digest — usually a crash plus a manual edit. Resolve it explicitly:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task repair \
-  visa-slot-tracker --adopt-visible
-```
-
-`--adopt-visible` registers what is on disk; `--discard-journal` drops the record
-and leaves the file to be handled as an unregistered deliverable. Both are
-audited.
-
-If a consequential browser action may have succeeded before the worker lost
-contact, its status becomes `OUTCOME_UNKNOWN`. It cannot be retried or counted
-as complete until an observed result is recorded. The evidence must be the
-SHA-256 of an artifact that is actually stored under the task, so "observed
-result" cannot be satisfied with free text:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task action-reconcile \
-  visa-slot-tracker <action-id> \
-  --verified --evidence-sha256 <sha256-of-a-stored-evidence-artifact>
-```
-
-## Completion invariants
-
-A task can complete only when:
-
-- no run remains active;
-- the outcome summary is substantive;
-- the workspace is not archived;
-- every declared deliverable exists, is safe, and matches its digest;
-- every deliverable was explicitly published as verified (`publish --verified`);
-- consequential external actions are reconciled;
-- no unresolved action of any class remains;
-- no publish staging, journal entry, or unregistered visible file remains.
-
-`doctor` and `complete` share one consistency checker, so a task cannot reach
-`COMPLETED` in a state the health check reports as broken. Run the check at any
-time; it exits `2` when anything is wrong, in both text and JSON form:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task doctor visa-slot-tracker
-PYTHONPATH=src python3 -m browser_tasks.cli task doctor visa-slot-tracker --json
-```
-
-Exit codes are stable for scripting: `0` success, `1` unexpected I/O failure,
-`2` policy or validation denial, `3` conflict, `4` unknown workspace, `5` scan
-findings (`browser-tasks scan` only, so a caller can tell findings from a scan
-that could not run).
-
-## Browser and action policy
-
-Surf is the only browser adapter. Browser tabs and authenticated sessions
-belong to the user's browser. In-app browsers, direct browser APIs, and silent
-transport fallbacks are forbidden.
-
-Before an external browser, reasoning, or research action:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli guard \
-  visa-slot-tracker --capability research --tool web-chat
-```
-
-Both transports call this guard themselves and refuse to run when it denies, so
-it is an enforced precondition rather than a convention. The guard also denies an
-unknown, archived, cancelled, or superseded workspace.
-
-Consequential actions require an exact task-bound authorization. The executor
-records pre-action state, executes once, observes the result, and verifies
-explicit postconditions. An ambiguous external outcome blocks automatic retry.
-
-The authorized envelope covers the postconditions, so a grant approved for a
-strictly verified action cannot be spent on the same summary with the checks
-removed. A consequential action must declare at least one supported
-postcondition, and a verified consequential result must carry evidence.
-
-Every step of that sequence is reachable from the CLI, fenced by the run that
-owns the lease:
-
-```sh
-PYTHONPATH=src python3 -m browser_tasks.cli task bind-adapter \
-  visa-slot-tracker --adapter surf:session-42 --resource tab-7
-
-PYTHONPATH=src python3 -m browser_tasks.cli task grant-install \
-  visa-slot-tracker --grant-id grant-1 \
-  --action-class commit_external \
-  --target https://example.test/book \
-  --summary "Book the reserved slot" \
-  --postcondition '{"type": "url_equals", "value": "https://example.test/done"}' \
-  --expires-at 2026-07-26T00:00:00+00:00
-
-PYTHONPATH=src python3 -m browser_tasks.cli task action-intent \
-  visa-slot-tracker book-1 \
-  --run-id <run-id> --lease-owner agent-session-42 \
-  --grant-id grant-1 \
-  --action-class commit_external \
-  --target https://example.test/book \
-  --summary "Book the reserved slot" \
-  --postcondition '{"type": "url_equals", "value": "https://example.test/done"}'
-
-PYTHONPATH=src python3 -m browser_tasks.cli task action-result \
-  visa-slot-tracker book-1 \
-  --run-id <run-id> --lease-owner agent-session-42 \
-  --outcome verified --evidence-sha256 <sha256>
-```
-
-A consequential intent requires `--grant-id`: reserving execution, validating
-and consuming the grant, and recording the intent happen in one transaction that
-also requires the caller to hold the workspace's current, unexpired lease. There
-is no path that records a consequential intent without an authorization. A worker
-whose lease lapsed, or whose run was replaced, cannot act, and a semantically
-identical retry is refused while the first attempt is unresolved.
-
-Browser resource claims are released when the run finishes and when the workspace
-completes, is archived or is cancelled; release them by hand with
-`task release-resources` if a claim outlives its use.
-
-Browser tabs are claimed in a registry beside the workspaces, so two tasks cannot
-drive the same tab.
-
-## ChatGPT Web delegation
-
-`tools/web-chat/web-chat.zsh` is the canonical reasoning and research delegate.
-It uses Surf UI only and freezes the exact prompt before disclosure.
-
-Prepare without sending:
-
-```sh
+# 1. Freeze the prompt and any attachment; prints a context digest
 tools/web-chat/web-chat.zsh \
-  --task-id microbusiness-ideas \
+  --task-id visa-slot-tracker \
   --purpose research \
-  --reasoning best \
-  --research standard \
-  --task-file /tmp/exact-research-task.md \
+  --task-file /tmp/question.md \
   --prepare-only
-```
 
-The live phase requires approval of the exact context SHA-256 printed by the
-prepare phase. There is no API, alternate browser, or research-provider
-fallback.
-
-The frozen prompt ends with a request sentinel, and submission is accepted only
-when the delivered message contains both the request id and that sentinel, so a
-truncated paste cannot pass verification. The reasoning level is verified from the
-composer pill with the selector closed, and the receipt records the research mode
-that was actually observed.
-
-Receipts, prompts, and responses live in a private directory under the system
-temporary directory. Hand them to the workspace instead of leaving them there:
-
-```sh
+# 2. Submit that exact digest, recording the disclosure in the workspace
 tools/web-chat/web-chat.zsh \
-  --task-id microbusiness-ideas \
-  --record-run-id <run-id> \
-  --approved-context-sha <sha256> \
-  ...
+  --task-id visa-slot-tracker \
+  --purpose research \
+  --task-file /tmp/question.md \
+  --record-run-id <run-id> --record-lease-owner session-42 \
+  --approved-context-sha <digest>
 ```
 
-`--record-run-id` is required for a live submission: the receipt and response are
-validated against the request identity, stored under `.task/runs/<run-id>/` and
-appended to the audit log, after which the temporary directory is removed. Add
-`--record-lease-owner` when that run is still active. `--keep` forces retention,
-failures always retain the directory so the tab id and frozen prompt survive, and
-directories older than seven days are pruned on start. Use `--workspace-root` when
-the workspace lives outside this repository.
-
-Preparing context is itself recorded: every prepare appends a
-`delegation.prepared` event carrying the request id, purpose, destination and
-context SHA-256, so `task audit` shows that context was frozen for disclosure even
-when nothing was submitted.
-
-Use Deep Research only when explicitly requested or when a large or exhaustive
-corpus also requires cross-source, regulatory, unfamiliar-domain, or
-high-branching analysis.
-
-## Repository review
-
-`tools/web-review/web-review.zsh` freezes and verifies a repository, diff, or
-selected context, then delegates review through the same strict Surf path.
-
-The packer excludes, case-insensitively:
-
-- `tasks/**`;
-- `archive/**`;
-- Git internals;
-- credential filenames and key material;
-- symlinks, which are recorded in `manifest/excluded.txt` rather than packaged;
-- unsupported or unsafe entries.
-
-Every packed file is then content-scanned for private keys, authorization and
-cookie headers, credentialed URLs, tokens, and binary payloads. A finding fails
-the run; a known-benign match must be approved by name and is recorded in the
-manifest and the receipt:
+For a code review, `tools/web-review/web-review.zsh` packages the repository
+first and then uses the same path:
 
 ```sh
 tools/web-review/web-review.zsh repo \
   --task-id harness-hardening \
-  --task "Review correctness, security, recovery, and missing validation." \
-  --reasoning best \
-  --research standard \
-  --allow-finding "tests/test_core.py:api_token" \
+  --task-file /tmp/review-task.md \
   --prepare-only
 ```
 
-Tracked paths that are absent from the worktree are named in
-`manifest/missing.txt` and in the receipt, so a snapshot cannot claim to be
-complete while dropping files anonymously.
+Before anything leaves the machine it is scanned for keys, tokens, credentialed
+URLs and stray binaries; `tasks/` and `archive/` are never uploaded. Packaging
+is reproducible, so the digest you approve is the digest that gets sent.
 
-The archive is built reproducibly — sorted entries, fixed mtimes, fixed
-ownership, single-threaded compression — so preparing the same tree twice yields
-the same bytes and the same context SHA-256. That is what lets the two-phase
-approval converge: the hash you approve is the hash the live phase computes.
+## Two commands worth remembering
 
-## Other commands
+```sh
+browser-tasks task doctor visa-slot-tracker   # is everything consistent?
+browser-tasks task repair visa-slot-tracker   # fix what can be fixed automatically
+```
 
-`task enforce-policy` pins an existing workspace to the delegate-first policy;
-`task archive` / `task restore` hide and unhide a workspace; `task alias` adds a
-search alias; `task cancel` retires an intent; `task run-heartbeat`,
-`task run-state` and `task run-abandon` manage an active run's lease and state;
-`task release-resources` gives up browser claims; `task delegation-record` and
-`task delegation-prepared` are called by the transports to persist disclosure
-evidence; `browser-tasks scan` runs the content scanner over explicit paths.
+`doctor` exits non-zero when something is wrong, and completing a task runs the
+same checks — a workspace cannot be closed in a state `doctor` calls broken.
+`repair` finishes or rolls back an interrupted write, clears leftovers, and says
+plainly when a state needs your decision instead of guessing.
+
+## Why the statuses exist
+
+Each status family answers one specific way this kind of work breaks:
+
+- **Task states** (`OPEN`, `PAUSED`, `COMPLETED`, …) describe the durable
+  intent. **Run states** (`EXECUTING`, `WAITING`, `INTERRUPTED`, …) describe one
+  attempt. Kept apart so today's failed check does not condemn a tracker that
+  works.
+- **Leases** give an active run an owner and an expiry. A worker that dies is
+  detected and its run becomes `INTERRUPTED` rather than "running" forever.
+- **Action states** include `OUTCOME_UNKNOWN`: we clicked, then lost contact. It
+  blocks blind retries, because a second submitted form is worse than none.
+- Consequential actions need an explicit authorization, at least one observable
+  success condition, and evidence that is actually stored before the result can
+  be called verified.
+
+`AGENTS.md` holds the full policy; `browser-tasks task --help` lists every
+subcommand; `tools/*/README.md` documents the transports.
+
+Exit codes: `0` success, `1` unexpected I/O failure, `2` denial or validation
+error, `3` conflict, `4` unknown workspace, `5` scan findings.
 
 ## Validation
 
 ```sh
-python3 -m pip install -e '.[dev]'
 PYTHONPATH=src pytest
-zsh -n tools/web-chat/web-chat.zsh
-zsh -n tools/web-chat/smoke-test.zsh
 tools/web-chat/smoke-test.zsh
-zsh -n tools/web-review/web-review.zsh
-zsh -n tools/web-review/smoke-test.zsh
 tools/web-review/smoke-test.zsh
 ```
 
-The smoke suites use fake Surf executables and isolated Git fixtures. They do
-not touch a real browser. They create their own workspace root, so the enforced
-guard has a real workspace to answer for, and they cover the prepare → approve →
-live handshake end to end, including that two preparations of the same tree
-produce the same context SHA-256.
+The suites use fake browser executables and isolated Git fixtures. They never
+touch a real browser or send anything anywhere.
 
-Timestamp-shaped and generic workspace names are rejected on every path, not only
-at creation; an existing workspace with such a name is reported by `task list` as
-damaged rather than silently skipped.
+## License
+
+MIT — see [LICENSE](LICENSE).
